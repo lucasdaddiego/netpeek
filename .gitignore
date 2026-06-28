@@ -1,0 +1,5 @@
+# Rust build artifacts (the release binary is symlinked into ~/.bin, never committed)
+/target/
+
+# Editor / local agent config
+.claude/

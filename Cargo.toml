@@ -1,0 +1,30 @@
+[package]
+name = "netpeek"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Live per-process network bandwidth TUI for macOS, straight off the private kernel-control interface nettop uses."
+repository = "https://github.com/lucasdaddiego/netpeek"
+readme = "README.md"
+keywords = ["network-monitor", "bandwidth", "tui", "macos", "nettop"]
+categories = ["command-line-utilities", "visualization"]
+
+[[bin]]
+name = "netpeek"
+path = "src/main.rs"
+
+[dependencies]
+# TUI + terminal. crossterm is re-exported by ratatui (ratatui::crossterm), so we
+# never pin it separately — there's only ever one crossterm in the tree.
+ratatui = "0.29"
+# Raw socket / ioctl / getnameinfo syscalls.
+libc = "0.2"
+# Safe, checked casting of the kernel's #[repr(C)] wire structs to/from bytes.
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
