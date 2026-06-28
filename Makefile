@@ -62,9 +62,12 @@ help: ## Show this help
 		| awk 'BEGIN {FS = ":.*?## "} {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 # Guard: a clear message instead of cargo's "no such subcommand" when the
-# coverage tooling is missing. Not a real file, never up to date.
+# coverage tooling is missing. Probe via `cargo llvm-cov` (how the targets
+# actually call it) rather than `command -v cargo-llvm-cov` — cargo finds its
+# subcommands in ~/.cargo/bin even when that dir isn't on PATH, so command -v
+# would false-negative. Not a real file, never up to date.
 .PHONY: cargo-llvm-cov
 cargo-llvm-cov:
-	@command -v cargo-llvm-cov >/dev/null || { \
+	@cargo llvm-cov --version >/dev/null 2>&1 || { \
 		echo "cargo-llvm-cov not found — install it with:"; \
 		echo "    cargo install cargo-llvm-cov"; exit 1; }
