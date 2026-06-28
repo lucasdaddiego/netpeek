@@ -34,14 +34,16 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      # --locked: fail if Cargo.lock is stale (e.g. a Dependabot bump that wasn't
+      # regenerated), so CI builds exactly the pinned, audited dependency set.
       - name: Clippy (warnings = errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
 
       # The pure modules (wire protocol, model, app state, formatting, services)
       # carry the gate; the syscall / TUI / entrypoint plumbing is excluded.

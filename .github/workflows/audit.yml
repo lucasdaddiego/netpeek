@@ -1,0 +1,39 @@
+name: audit
+
+# RUSTSEC advisory scan over the dependency tree. Runs when the manifest or
+# lockfile changes, and weekly so a freshly-disclosed advisory against an
+# already-pinned dependency still gets caught.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+  schedule:
+    - cron: "27 4 * * 1" # Mondays 04:27 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RUSTSEC)
+    # cargo-audit only parses Cargo.lock against the advisory DB — it doesn't
+    # build the crate — so this runs on Linux even though netpeek is macOS-only.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit dependencies
+        run: cargo audit

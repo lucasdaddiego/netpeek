@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Rust dependencies. Grouped so a refresh is one PR, not one-per-crate — the
+  # tree is small but ratatui pulls a fair transitive set.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  # The workflow actions themselves (checkout, rust-cache, install-action, …).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
