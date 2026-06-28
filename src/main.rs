@@ -316,6 +316,9 @@ fn run_loop(
     // rebuild+redraw entirely instead of busy-redrawing ~8×/sec.
     let mut shown_len = 0usize;
     let mut shown_pid: Option<u32> = None;
+    // Pause freezes sampling, so on resume we re-prime rather than measure a
+    // delta that spans the whole pause (which would render as a rate spike).
+    let mut was_paused = false;
 
     loop {
         // Ingest whatever the kernel has sent since last loop.
@@ -323,9 +326,17 @@ fn run_loop(
 
         // Recompute rates / aggregates once per interval (unless frozen).
         let now = Instant::now();
-        if app.paused {
-            *last_tick = now; // keep dt small so resume doesn't spike
-        } else if now.duration_since(*last_tick) >= interval {
+        if was_paused && !app.paused {
+            // Resume edge: fetch fresh counters now and re-baseline every flow on
+            // the next tick (same priming the engine does at startup), so the
+            // paused interval isn't divided into a single tick as a spike.
+            mon.poll_counts()?;
+            mon.reprime();
+            *last_tick = now;
+        }
+        was_paused = app.paused;
+
+        if !app.paused && now.duration_since(*last_tick) >= interval {
             let dt = now.duration_since(*last_tick).as_secs_f64();
             mon.tick(dt);
             mon.poll_counts()?;

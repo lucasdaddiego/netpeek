@@ -45,6 +45,12 @@ pub struct Flow {
     pub tx_rate: f64,
     /// Set once a descriptor has named the flow (pid / addrs known).
     described: bool,
+    /// False until a `tick` has captured a baseline counter for this flow. The
+    /// kernel's counters are cumulative since the flow began, so the first delta
+    /// — against zero at startup, or against a stale value after a pause — would
+    /// read as a one-tick spike. While unprimed a tick just captures the baseline
+    /// and reports a zero rate. See [`Engine::tick`] and [`Engine::reprime`].
+    primed: bool,
 }
 
 impl Flow {
@@ -63,6 +69,7 @@ impl Flow {
             rx_rate: 0.0,
             tx_rate: 0.0,
             described: false,
+            primed: false,
         }
     }
 }
@@ -218,7 +225,14 @@ impl Engine {
     /// process's sparkline history. Call once per refresh interval.
     pub fn tick(&mut self, dt: f64) {
         for f in self.flows.values_mut() {
-            if dt > 0.0 {
+            if !f.primed {
+                // First sample for this flow (or first after a resume): capture
+                // the baseline, don't emit a rate. The counter is cumulative
+                // since the flow began, so a delta against zero/stale would spike.
+                f.rx_rate = 0.0;
+                f.tx_rate = 0.0;
+                f.primed = true;
+            } else if dt > 0.0 {
                 f.rx_rate = f.rx_bytes.saturating_sub(f.prev_rx) as f64 / dt;
                 f.tx_rate = f.tx_bytes.saturating_sub(f.prev_tx) as f64 / dt;
             } else {
@@ -305,6 +319,19 @@ impl Engine {
                 }
             })
             .collect();
+    }
+
+    /// Drop every flow's rate baseline so the next `tick` re-establishes it
+    /// (reporting a zero rate for that tick) instead of measuring a delta.
+    ///
+    /// Used when resuming from a pause: while paused we stop sampling, so a
+    /// flow's stored counter goes stale. Measuring the first post-resume delta
+    /// against it would divide the whole pause's bytes into one interval — a
+    /// spike. Re-priming (after a fresh `poll_counts`) re-baselines instead.
+    pub fn reprime(&mut self) {
+        for f in self.flows.values_mut() {
+            f.primed = false;
+        }
     }
 
     /// The current per-process rows (unsorted; caller sorts/filters).
@@ -452,6 +479,15 @@ mod tests {
             1,
             Counts {
                 rx_bytes: 5_000,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0); // prime first
+                     // a primed flow ticked with dt == 0 must not divide by zero
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 9_000,
                 tx_bytes: 0,
             },
         );
@@ -647,6 +683,85 @@ mod tests {
         e.tick(1.0);
         assert_eq!(e.rows()[0].rx_rate, 800.0);
         assert_eq!(e.rows()[0].name, "mdns");
+    }
+
+    #[test]
+    fn first_tick_primes_baseline_instead_of_spiking() {
+        // A flow that already has a large cumulative counter when first sampled
+        // (it existed before we subscribed) must not read that whole total as a
+        // one-tick rate. The first tick captures the baseline (rate 0); only the
+        // next delta is a real rate.
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(100, "curl", 443));
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 5_000_000, // huge pre-existing total
+                tx_bytes: 1_000_000,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_rate, 0.0); // baseline captured, not a spike
+        assert_eq!(e.rows()[0].tx_rate, 0.0);
+        // a genuine delta on the next tick reads as a real rate
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 5_002_000,
+                tx_bytes: 1_000_500,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_rate, 2_000.0);
+        assert_eq!(e.rows()[0].tx_rate, 500.0);
+    }
+
+    #[test]
+    fn reprime_rebaselines_so_resume_does_not_spike() {
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(100, "curl", 443));
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 1_000,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0); // prime
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 3_000,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_rate, 2_000.0);
+
+        // Simulate a pause: the kernel counter jumps far ahead while we weren't
+        // sampling. reprime() (after a fresh poll) must re-baseline so the first
+        // tick back doesn't divide the whole pause into one interval.
+        e.reprime();
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 1_000_000, // jumped during the pause
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_rate, 0.0); // re-baselined, no spike
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 1_002_000,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_rate, 2_000.0); // back to a true rate
     }
 
     fn row(pid: u32, name: &str, rate: f64, total: u64, conns: usize) -> ProcRow {

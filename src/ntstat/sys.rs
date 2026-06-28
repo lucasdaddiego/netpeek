@@ -122,30 +122,41 @@ impl ControlSocket {
         Ok(())
     }
 
-    /// Send one request datagram.
+    /// Send one request datagram. A signal (e.g. `SIGWINCH` on a terminal
+    /// resize) can interrupt the syscall with `EINTR`; we retry rather than fail.
     pub fn send_bytes(&self, buf: &[u8]) -> io::Result<()> {
-        // SAFETY: send from a valid slice on a connected socket.
-        let n = unsafe { send(self.fd, buf.as_ptr() as *const c_void, buf.len(), 0) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            // SAFETY: send from a valid slice on a connected socket.
+            let n = unsafe { send(self.fd, buf.as_ptr() as *const c_void, buf.len(), 0) };
+            if n >= 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
         }
-        Ok(())
     }
 
     /// Receive one datagram. Returns `Ok(None)` when the socket would block
-    /// (nothing pending) — the caller drains in a loop until it sees `None`.
+    /// (nothing pending) — the caller drains in a loop until it sees `None`. A
+    /// signal-interrupted (`EINTR`) recv is retried, not surfaced as an error.
     pub fn recv_into(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        // SAFETY: recv into a valid mutable slice.
-        let n = unsafe { recv(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
-        if n < 0 {
+        loop {
+            // SAFETY: recv into a valid mutable slice.
+            let n = unsafe { recv(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
+            if n >= 0 {
+                return Ok(Some(n as usize));
+            }
             let err = io::Error::last_os_error();
-            // On Darwin EWOULDBLOCK == EAGAIN, so matching EAGAIN covers both.
-            return match err.raw_os_error() {
-                Some(libc::EAGAIN) => Ok(None),
-                _ => Err(err),
-            };
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // On Darwin EWOULDBLOCK == EAGAIN, so matching EAGAIN covers both.
+                Some(libc::EAGAIN) => return Ok(None),
+                _ => return Err(err),
+            }
         }
-        Ok(Some(n as usize))
     }
 }
 

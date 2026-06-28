@@ -168,6 +168,13 @@ impl Monitor {
         self.engine.tick(dt);
     }
 
+    /// Re-baseline every flow's rate reference on the next `tick`. Pair with a
+    /// fresh [`Monitor::poll_counts`] when resuming from a pause so the gap isn't
+    /// rendered as a one-tick rate spike.
+    pub fn reprime(&mut self) {
+        self.engine.reprime();
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
