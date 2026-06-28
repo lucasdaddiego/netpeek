@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-coverage:
+    name: build · clippy · test · coverage
+    # macOS is the real platform — the kernel control socket is macOS-only, and
+    # the crate doesn't build on Linux (libproc / Darwin libc). The unit tests
+    # are hermetic (no socket, no network, no root), so they run fine in CI.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Tests
+        run: cargo test
+
+      # The pure modules (wire protocol, model, app state, formatting, services)
+      # carry the gate; the syscall / TUI / entrypoint plumbing is excluded.
+      - name: Coverage gate (pure core ≥ 99% lines)
+        run: >
+          cargo llvm-cov
+          --ignore-filename-regex 'src/(ui|dns|main)\.rs|src/ntstat/(sys|mod)\.rs'
+          --summary-only --fail-under-lines 99
