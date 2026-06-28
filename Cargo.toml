@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # TUI + terminal. crossterm is re-exported by ratatui (ratatui::crossterm), so we
 # never pin it separately — there's only ever one crossterm in the tree.
-ratatui = "0.29"
+ratatui = "0.30"
 # Raw socket / ioctl / getnameinfo syscalls.
 libc = "0.2"
 # Safe, checked casting of the kernel's #[repr(C)] wire structs to/from bytes.
