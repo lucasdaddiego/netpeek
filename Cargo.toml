@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
-description = "Live per-process network bandwidth TUI for macOS, straight off the private kernel-control interface nettop uses."
+description = "Live per-process network bandwidth TUI for macOS — real pid-attributed rates and flows from the same private kernel interface nettop uses, no sudo, no packet capture."
 repository = "https://github.com/lucasdaddiego/netpeek"
 readme = "README.md"
-keywords = ["network-monitor", "bandwidth", "tui", "macos", "nettop"]
-categories = ["command-line-utilities", "visualization"]
+keywords = ["bandwidth", "network", "tui", "macos", "nettop"]
+categories = ["command-line-utilities", "network-programming", "os::macos-apis", "visualization"]
 
 [[bin]]
 name = "netpeek"
