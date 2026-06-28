@@ -69,9 +69,9 @@ no helper processes.
 - **Expand to flows** — press <kbd>enter</kbd> on a process to open a detail pane
   listing each connection: remote host, port → service name, TCP/UDP, TCP state
   and per-flow throughput.
-- **Async reverse DNS** — remote IPs resolve to hostnames on a background thread
-  with a cache, so the lookup never blocks or stutters the UI (`--no-resolve`
-  to skip it).
+- **Async reverse DNS** — remote IPs resolve to hostnames on a small pool of
+  background threads with a cache, so the lookup never blocks or stutters the UI
+  (`--no-resolve` to skip it).
 - **Up/down sparklines** per process — a glance shows a burst from a steady
   trickle.
 - **Sort any way** — by rate, total bytes, name, connection count or pid; press
@@ -122,6 +122,7 @@ netpeek --json            # one snapshot as a JSON array on stdout (pipe into jq
 netpeek --diag            # connectivity + permission diagnostics
 netpeek --interval 0.5    # faster refresh / sampling (default 1.0s, min 0.2)
 netpeek --no-resolve      # don't reverse-DNS remote hosts
+netpeek --mouse           # capture the mouse so the wheel scrolls the list
 netpeek --help            # usage summary
 ```
 
@@ -132,6 +133,7 @@ netpeek --help            # usage summary
 | `--diag` | Print socket connectivity, privilege, flow/process counts and top talkers. |
 | `--interval SECS` | Refresh and rate-sampling interval (default `1.0`, minimum `0.2`). |
 | `--no-resolve` | Skip reverse DNS; the detail pane shows raw IPs. |
+| `--mouse` | Capture the mouse so the wheel scrolls the list. Off by default, so the terminal's own text selection / copy keeps working (the keys scroll regardless). |
 | `--version`, `-V` | Print version. |
 | `--help`, `-h` | Show usage. |
 
@@ -149,7 +151,8 @@ Everything else is a **live** control — see the keys below.
 | <kbd>/</kbd> | filter by name or pid | | | (repeat a sort key to reverse) |
 | <kbd>p</kbd> | pause / freeze | | <kbd>?</kbd> | help |
 
-The mouse wheel scrolls the list too.
+Run with `--mouse` and the mouse wheel scrolls the list too — it's off by
+default so the terminal's own text selection / copy keeps working.
 
 ## Reading the table
 
@@ -159,7 +162,7 @@ The mouse wheel scrolls the list too.
 | **PROCESS** | Process name from the kernel; falls back to the executable name for unnamed flows. |
 | **DOWN** / **UP** | Receive / transmit **rate** (bytes/sec), derived from the change in the kernel's cumulative counters over the interval. Dimmed when idle. |
 | **↓** / **↑** | Sparkline of recent down / up rates (last ~60 samples), scaled to that process's own peak. |
-| **TOTAL** | Cumulative bytes (down + up) the kernel has counted for the process's current flows. |
+| **TOTAL** | Cumulative bytes (down + up) across the process's flows, including ones that have since closed (held while the process stays active). |
 | **CONNS** | Number of open flows (sockets) the process currently has. |
 
 In the expanded **detail pane**, each flow shows protocol, TCP state, the remote
@@ -219,8 +222,8 @@ the private, undocumented interface behind `nettop`. The exchange:
 The `#[repr(C)]` request structs are cast to/from bytes with
 [`bytemuck`](https://docs.rs/bytemuck) (checked, no `unsafe` transmutes); the
 syscalls go through [`libc`](https://docs.rs/libc). Reverse DNS is `getnameinfo`
-on a background thread. Process-name fallback for unnamed flows uses
-`proc_pidpath`.
+on a small pool of background threads. Process-name fallback for unnamed flows
+uses `proc_pidpath`.
 
 ## Accuracy & honest limitations
 
@@ -243,9 +246,12 @@ on a background thread. Process-name fallback for unnamed flows uses
   the flows your user owns — which is the point of an inward-facing tool. Run with
   `sudo` to see *every* process on the machine. `--diag` reports which mode you're
   in.
-- **Counters are per current flow.** "Total" is the cumulative bytes of a
-  process's currently-open flows; when a flow closes the kernel retires it, so
-  totals reflect live connections, not all-time history.
+- **Totals span a process's active session, not all time.** "Total" sums a
+  process's flows *including ones that have since closed*, so the figure doesn't
+  drop when a single connection ends. The tally is kept only while the process
+  still has at least one live flow; once it has none it leaves the table and the
+  count resets — which also keeps memory bounded and avoids crediting one
+  process's bytes to a later process that reuses its pid.
 - **No on-wire inspection.** This is byte accounting, not packet capture — there
   are no payloads, no DPI, no protocol decoding beyond port → service naming.
 - **Linux: planned, out of scope for v1.** The equivalent there is a different

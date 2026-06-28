@@ -162,8 +162,9 @@ extern "C" {
 }
 
 /// The executable's file name for `pid` via `proc_pidpath`, used to name a flow
-/// when the kernel's own (≤16-char) `pname` field comes back empty. `None` if the
-/// process is gone or not introspectable.
+/// when the kernel's own `pname` field (a 64-byte slot, filled from the process's
+/// short name) comes back empty. `None` if the process is gone or not
+/// introspectable.
 pub fn proc_name(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;

@@ -143,6 +143,11 @@ impl ProcHist {
 pub struct Engine {
     flows: HashMap<u64, Flow>,
     hist: HashMap<u32, ProcHist>,
+    /// Per-pid (rx, tx) bytes from already-closed flows, so a process's TOTAL
+    /// doesn't drop when one of its connections ends. Carried only while the pid
+    /// still has a live flow and pruned the moment it has none — that bounds the
+    /// map and stops one pid's bytes bleeding into a later, reused pid.
+    retired: HashMap<u32, (u64, u64)>,
     rows: Vec<ProcRow>,
     hist_len: usize,
 }
@@ -152,6 +157,7 @@ impl Engine {
         Engine {
             flows: HashMap::new(),
             hist: HashMap::new(),
+            retired: HashMap::new(),
             rows: Vec::new(),
             hist_len: hist_len.max(1),
         }
@@ -195,9 +201,16 @@ impl Engine {
         self.on_counts(srcref, counts);
     }
 
-    /// A source went away.
+    /// A source went away. Its final byte counts are carried onto the owning pid
+    /// so the process's TOTAL stays monotonic while it still has other flows.
     pub fn on_removed(&mut self, srcref: u64) {
-        self.flows.remove(&srcref);
+        if let Some(f) = self.flows.remove(&srcref) {
+            if f.described && f.pid != 0 {
+                let carry = self.retired.entry(f.pid).or_insert((0, 0));
+                carry.0 = carry.0.saturating_add(f.rx_bytes);
+                carry.1 = carry.1.saturating_add(f.tx_bytes);
+            }
+        }
     }
 
     /// Recompute per-flow rates from the counter deltas over `dt` seconds, then
@@ -247,6 +260,17 @@ impl Engine {
             e.tx_total = e.tx_total.saturating_add(f.tx_bytes);
             e.conns += 1;
         }
+
+        // Fold in bytes from each pid's already-closed flows, then forget the
+        // carry for any pid that no longer has a live flow — so it leaves with
+        // the row rather than lingering or bleeding into a reused pid.
+        for (pid, agg) in by_pid.iter_mut() {
+            if let Some(&(rx, tx)) = self.retired.get(pid) {
+                agg.rx_total = agg.rx_total.saturating_add(rx);
+                agg.tx_total = agg.tx_total.saturating_add(tx);
+            }
+        }
+        self.retired.retain(|pid, _| by_pid.contains_key(pid));
 
         // Update history, dropping pids that no longer have flows.
         self.hist.retain(|pid, _| by_pid.contains_key(pid));
@@ -515,6 +539,69 @@ mod tests {
         e.tick(1.0);
         assert!(e.rows().is_empty());
         assert_eq!(e.flow_count(), 0);
+    }
+
+    #[test]
+    fn total_includes_closed_flows_while_process_stays_active() {
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_added(2, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(50, "x", 80));
+        e.on_desc(2, Proto::Tcp, desc(50, "x", 443));
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 1_000,
+                tx_bytes: 100,
+            },
+        );
+        e.on_counts(
+            2,
+            Counts {
+                rx_bytes: 2_000,
+                tx_bytes: 200,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_total, 3_000);
+        assert_eq!(e.rows()[0].tx_total, 300);
+        // flow 1 closes but flow 2 is still live → TOTAL must not drop
+        e.on_removed(1);
+        e.tick(1.0);
+        let r = &e.rows()[0];
+        assert_eq!(r.conns, 1); // only the live flow is counted as a connection
+        assert_eq!(r.rx_total, 3_000); // 2_000 live + 1_000 carried from the closed flow
+        assert_eq!(r.tx_total, 300);
+    }
+
+    #[test]
+    fn retired_carry_is_dropped_once_a_pid_has_no_flows() {
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(50, "x", 80));
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 5_000,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0);
+        e.on_removed(1);
+        e.tick(1.0);
+        assert!(e.rows().is_empty()); // no live flows → process leaves the table
+                                      // a fresh flow for the same pid starts from zero, not 5_000 (no stale carry)
+        e.on_added(2, Proto::Tcp);
+        e.on_desc(2, Proto::Tcp, desc(50, "x", 443));
+        e.on_counts(
+            2,
+            Counts {
+                rx_bytes: 10,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_total, 10);
     }
 
     #[test]

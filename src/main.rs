@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
+use ratatui::widgets::TableState;
 
 use netpeek::app::{App, Cmd, Mode};
 use netpeek::dns::Resolver;
@@ -24,6 +25,9 @@ const DEFAULT_INTERVAL: f64 = 1.0;
 struct Opts {
     interval: f64,
     resolve: bool,
+    /// Capture the mouse for wheel-scroll. Off by default so the terminal's own
+    /// text selection / copy keeps working (you can still scroll with the keys).
+    mouse: bool,
 }
 
 fn main() {
@@ -38,10 +42,12 @@ fn main() {
         return;
     }
 
-    let known_flags = ["--once", "--json", "--diag", "--no-resolve"];
+    // Mode flags consumed later via `args.iter().any(..)`; accepted as no-ops here.
+    let known_flags = ["--once", "--json", "--diag"];
     let mut opts = Opts {
         interval: DEFAULT_INTERVAL,
         resolve: true,
+        mouse: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -57,6 +63,7 @@ fn main() {
                 }
             }
             "--no-resolve" => opts.resolve = false,
+            "--mouse" => opts.mouse = true,
             a if known_flags.contains(&a) => {}
             a => {
                 eprintln!("netpeek: unknown argument '{a}' (try --help)");
@@ -98,10 +105,9 @@ fn load_services() -> Services {
     s
 }
 
-/// Run a handful of collection cycles so rates are populated, then return the
-/// monitor. Shared by the one-shot (`--once`/`--json`/`--diag`) modes.
-fn collect_snapshot(opts: &Opts) -> io::Result<Monitor> {
-    let mut mon = Monitor::new(HIST_LEN)?;
+/// Run a handful of collection cycles on an already-open monitor so rates are
+/// populated. Shared by the one-shot (`--once`/`--json`/`--diag`) modes.
+fn collect_snapshot(mon: &mut Monitor, opts: &Opts) -> io::Result<()> {
     let dt = opts.interval;
     let sleep = Duration::from_secs_f64(dt);
     // Settle: descriptor requests are paced, so drain repeatedly to let every
@@ -117,7 +123,7 @@ fn collect_snapshot(opts: &Opts) -> io::Result<Monitor> {
         mon.drain()?;
         mon.tick(dt);
     }
-    Ok(mon)
+    Ok(())
 }
 
 fn sorted_rows(mon: &Monitor) -> Vec<ProcRow> {
@@ -127,7 +133,8 @@ fn sorted_rows(mon: &Monitor) -> Vec<ProcRow> {
 }
 
 fn run_oneshot(opts: &Opts, json: bool) -> io::Result<()> {
-    let mon = collect_snapshot(opts)?;
+    let mut mon = Monitor::new(HIST_LEN)?;
+    collect_snapshot(&mut mon, opts)?;
     let rows = sorted_rows(&mon);
     if json {
         print_json(&rows);
@@ -139,14 +146,17 @@ fn run_oneshot(opts: &Opts, json: bool) -> io::Result<()> {
 
 fn run_diag(opts: &Opts) -> io::Result<()> {
     println!("netpeek --diag");
-    match Monitor::new(HIST_LEN) {
-        Ok(_) => println!("  control socket   : connected (com.apple.network.statistics)"),
+    let mut mon = match Monitor::new(HIST_LEN) {
+        Ok(m) => {
+            println!("  control socket   : connected (com.apple.network.statistics)");
+            m
+        }
         Err(e) => {
             println!("  control socket   : FAILED — {e}");
             return Err(e);
         }
-    }
-    let mon = collect_snapshot(opts)?;
+    };
+    collect_snapshot(&mut mon, opts)?;
     let rows = sorted_rows(&mon);
     let total: f64 = rows.iter().map(|r| r.total_rate()).sum();
     println!(
@@ -254,7 +264,11 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
     let interval = Duration::from_secs_f64(opts.interval);
 
     let mut terminal = ratatui::init();
-    execute!(io::stdout(), EnableMouseCapture)?;
+    // Mouse capture is opt-in: enabling it lets the wheel scroll the list but
+    // takes over the mouse, disabling the terminal's own text selection / copy.
+    if opts.mouse {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    }
 
     // Prime the pump: collect initial sources and request the first counts.
     mon.drain()?;
@@ -274,7 +288,9 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
         &mut last_update,
     );
 
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    if opts.mouse {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     res
 }
@@ -291,6 +307,16 @@ fn run_loop(
     last_tick: &mut Instant,
     last_update: &mut String,
 ) -> io::Result<()> {
+    // Persisted across frames so the table's scroll offset survives (a fresh
+    // state each frame would reset it and pin the selection to the bottom).
+    let mut table_state = TableState::default();
+    let mut needs_redraw = true;
+    // Row count + cursor pid from the last rendered frame. Input is interpreted
+    // against what's on screen, so idle loops (no tick, no key) can skip the
+    // rebuild+redraw entirely instead of busy-redrawing ~8×/sec.
+    let mut shown_len = 0usize;
+    let mut shown_pid: Option<u32> = None;
+
     loop {
         // Ingest whatever the kernel has sent since last loop.
         mon.drain()?;
@@ -305,52 +331,71 @@ fn run_loop(
             mon.poll_counts()?;
             *last_tick = now;
             *last_update = clock_hms();
+            needs_redraw = true; // fresh counters
         }
 
-        // Build the visible (filtered + sorted) row set.
-        let mut rows: Vec<ProcRow> = mon
-            .engine()
-            .rows()
-            .iter()
-            .filter(|r| matches_filter(r, &app.filter))
-            .cloned()
-            .collect();
-        sort_rows(&mut rows, app.sort, app.sort_desc);
-        app.clamp_selection(rows.len());
+        if needs_redraw {
+            // Build the visible (filtered + sorted) row set.
+            let mut rows: Vec<ProcRow> = mon
+                .engine()
+                .rows()
+                .iter()
+                .filter(|r| matches_filter(r, &app.filter))
+                .cloned()
+                .collect();
+            sort_rows(&mut rows, app.sort, app.sort_desc);
+            app.clamp_selection(rows.len());
 
-        let selected_pid = rows.get(app.selected).map(|r| r.pid);
-        let flows = app
-            .expanded
-            .map(|pid| mon.engine().flows_for(pid))
-            .unwrap_or_default();
+            shown_len = rows.len();
+            shown_pid = rows.get(app.selected).map(|r| r.pid);
+            let flows = app
+                .expanded
+                .map(|pid| mon.engine().flows_for(pid))
+                .unwrap_or_default();
 
-        let status = ui::StatusInfo {
-            proc_count: rows.len(),
-            flow_count: mon.engine().flow_count(),
-            interval_secs: opts.interval,
-            last_update: last_update.clone(),
-            elevated: elevated(),
-        };
+            let status = ui::StatusInfo {
+                proc_count: rows.len(),
+                flow_count: mon.engine().flow_count(),
+                interval_secs: opts.interval,
+                last_update: last_update.clone(),
+                elevated: elevated(),
+            };
 
-        terminal.draw(|f| {
-            app.page = (f.area().height as usize).saturating_sub(6).max(1);
-            ui::draw(f, app, &rows, &flows, services, resolver, &status);
-        })?;
+            terminal.draw(|f| {
+                app.page = (f.area().height as usize).saturating_sub(6).max(1);
+                ui::draw(
+                    f,
+                    app,
+                    &rows,
+                    &flows,
+                    services,
+                    resolver,
+                    &status,
+                    &mut table_state,
+                );
+            })?;
+            needs_redraw = false;
+        }
 
-        // Drain input for up to ~120ms so keys feel instant but we still loop
-        // often enough to refresh and re-poll the socket.
+        // Wait briefly for input. A key / mouse / resize asks for a redraw on the
+        // next loop; with none we stay idle (just draining the socket).
         if event::poll(Duration::from_millis(120))? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     if let Some(cmd) = key_to_cmd(k.code, k.modifiers, app.mode) {
-                        app.handle(cmd, rows.len(), selected_pid);
+                        app.handle(cmd, shown_len, shown_pid);
                     }
+                    needs_redraw = true;
                 }
-                Event::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollDown => app.handle(Cmd::Down, rows.len(), selected_pid),
-                    MouseEventKind::ScrollUp => app.handle(Cmd::Up, rows.len(), selected_pid),
-                    _ => {}
-                },
+                Event::Mouse(m) => {
+                    match m.kind {
+                        MouseEventKind::ScrollDown => app.handle(Cmd::Down, shown_len, shown_pid),
+                        MouseEventKind::ScrollUp => app.handle(Cmd::Up, shown_len, shown_pid),
+                        _ => {}
+                    }
+                    needs_redraw = true;
+                }
+                Event::Resize(_, _) => needs_redraw = true,
                 _ => {}
             }
         }
@@ -428,6 +473,8 @@ OPTIONS:
     --diag            Connectivity + permission diagnostics
     --interval SECS   Refresh / sampling interval (default 1.0, min 0.2)
     --no-resolve      Skip reverse-DNS of remote hosts (TUI)
+    --mouse           Capture the mouse for wheel-scroll (off by default, so
+                      terminal text selection keeps working; keys still scroll)
     --version, -V     Print version
     --help, -h        This help
 

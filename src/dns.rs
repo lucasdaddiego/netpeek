@@ -9,12 +9,17 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::net::{IpAddr, SocketAddr};
 use std::os::raw::c_char;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 type Cache = Arc<Mutex<HashMap<IpAddr, Option<String>>>>;
 type InFlight = Arc<Mutex<HashSet<IpAddr>>>;
+
+/// Reverse-DNS worker threads. A small pool, so one slow or timing-out PTR
+/// lookup (`getnameinfo` has no timeout) can't stall every other hostname
+/// queued behind it.
+const DNS_WORKERS: usize = 4;
 
 pub struct Resolver {
     cache: Cache,
@@ -27,19 +32,29 @@ impl Resolver {
         let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
         let inflight: InFlight = Arc::new(Mutex::new(HashSet::new()));
         let (tx, rx) = mpsc::channel::<IpAddr>();
+        let rx = Arc::new(Mutex::new(rx));
 
-        let worker_cache = Arc::clone(&cache);
-        let worker_inflight = Arc::clone(&inflight);
-        thread::Builder::new()
-            .name("netpeek-dns".into())
-            .spawn(move || {
-                for ip in rx {
+        for n in 0..DNS_WORKERS {
+            let worker_cache = Arc::clone(&cache);
+            let worker_inflight = Arc::clone(&inflight);
+            let worker_rx: Arc<Mutex<Receiver<IpAddr>>> = Arc::clone(&rx);
+            thread::Builder::new()
+                .name(format!("netpeek-dns-{n}"))
+                .spawn(move || loop {
+                    // Hold the lock only for the blocking recv handoff; resolve
+                    // outside it so the workers run getnameinfo concurrently and
+                    // a slow lookup occupies just one of them.
+                    let ip = {
+                        let guard = worker_rx.lock().unwrap();
+                        guard.recv()
+                    };
+                    let Ok(ip) = ip else { break }; // sender dropped → shut down
                     let name = reverse_dns(ip);
                     worker_cache.lock().unwrap().insert(ip, name);
                     worker_inflight.lock().unwrap().remove(&ip);
-                }
-            })
-            .expect("spawn dns worker");
+                })
+                .expect("spawn dns worker");
+        }
 
         Resolver {
             cache,

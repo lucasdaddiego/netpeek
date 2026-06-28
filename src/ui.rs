@@ -28,6 +28,11 @@ const C_DIM: Color = Color::DarkGray;
 const C_ACCENT: Color = Color::Yellow;
 
 /// Draw the whole UI for one frame.
+///
+/// `table_state` is owned by the render loop and reused across frames so the
+/// table's scroll offset persists — otherwise a fresh state each frame resets
+/// the offset to 0 and the selection gets pinned to the bottom of long lists.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     f: &mut Frame,
     app: &App,
@@ -36,6 +41,7 @@ pub fn draw(
     services: &Services,
     resolver: Option<&Resolver>,
     status: &StatusInfo,
+    table_state: &mut TableState,
 ) {
     let show_detail = app.expanded.is_some() && !flows.is_empty();
     let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
@@ -50,7 +56,7 @@ pub fn draw(
         .split(f.area());
 
     draw_status(f, chunks[0], app, status);
-    draw_table(f, chunks[1], app, rows);
+    draw_table(f, chunks[1], app, rows, table_state);
     if show_detail {
         draw_detail(f, chunks[2], app, flows, services, resolver);
         draw_footer(f, chunks[3], app);
@@ -117,7 +123,7 @@ fn wide(area: Rect) -> bool {
     area.width >= 92
 }
 
-fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[ProcRow]) {
+fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[ProcRow], state: &mut TableState) {
     let show_spark = wide(area);
 
     let mark = |key: SortKey, base: &str| -> String {
@@ -213,11 +219,14 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[ProcRow]) {
         )
         .highlight_symbol("");
 
-    let mut state = TableState::default();
-    if !rows.is_empty() {
+    // Reuse the caller's persistent state so the scroll offset carries across
+    // frames; ratatui then nudges it minimally to keep the selection visible.
+    if rows.is_empty() {
+        state.select(None);
+    } else {
         state.select(Some(app.selected.min(rows.len() - 1)));
     }
-    f.render_stateful_widget(table, area, &mut state);
+    f.render_stateful_widget(table, area, state);
 }
 
 fn draw_detail(
@@ -241,8 +250,19 @@ fn draw_detail(
     ])
     .style(Style::default().fg(C_DIM).add_modifier(Modifier::BOLD));
 
-    let body: Vec<Row> = flows
+    // The pane is height-capped; flows are pre-sorted by rate, so show the top
+    // ones that fit and, when there are more, a final summary row instead of
+    // dropping them silently.
+    let capacity = (area.height as usize).saturating_sub(3); // top/bottom border + header
+    let (visible, hidden) = if capacity >= 1 && flows.len() > capacity {
+        (capacity - 1, flows.len() - (capacity - 1))
+    } else {
+        (flows.len(), 0)
+    };
+
+    let mut body: Vec<Row> = flows
         .iter()
+        .take(visible)
         .map(|fl| {
             let state = if fl.proto == crate::model::Proto::Tcp {
                 format::tcp_state(fl.tcp_state).to_string()
@@ -267,6 +287,18 @@ fn draw_detail(
             ])
         })
         .collect();
+    if hidden > 0 {
+        body.push(
+            Row::new(vec![
+                Cell::from("…"),
+                Cell::from(""),
+                Cell::from(format!("{hidden} more — sort by rate, top shown")),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(Style::default().fg(C_DIM)),
+        );
+    }
 
     let widths = [
         Constraint::Length(5),
