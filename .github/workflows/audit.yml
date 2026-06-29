@@ -5,7 +5,7 @@ name: audit
 # already-pinned dependency still gets caught.
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - Cargo.toml
       - Cargo.lock
