@@ -21,6 +21,12 @@ use netpeek::{format, ui};
 
 const HIST_LEN: usize = 60;
 const DEFAULT_INTERVAL: f64 = 1.0;
+/// Accepted `--interval` range. The floor keeps the sampling window meaningful;
+/// the ceiling is what stops `Duration::from_secs_f64` — which panics on a
+/// non-finite or out-of-range value — from ever seeing one ("inf" and "1e20"
+/// both parse as perfectly good `f64`s).
+const MIN_INTERVAL: f64 = 0.2;
+const MAX_INTERVAL: f64 = 3600.0;
 
 struct Opts {
     interval: f64,
@@ -42,36 +48,13 @@ fn main() {
         return;
     }
 
-    // Mode flags consumed later via `args.iter().any(..)`; accepted as no-ops here.
-    let known_flags = ["--once", "--json", "--diag"];
-    let mut opts = Opts {
-        interval: DEFAULT_INTERVAL,
-        resolve: true,
-        mouse: false,
-    };
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--interval" => {
-                i += 1;
-                match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
-                    Some(v) if v >= 0.2 => opts.interval = v,
-                    _ => {
-                        eprintln!("netpeek: --interval needs a number of seconds >= 0.2");
-                        std::process::exit(2);
-                    }
-                }
-            }
-            "--no-resolve" => opts.resolve = false,
-            "--mouse" => opts.mouse = true,
-            a if known_flags.contains(&a) => {}
-            a => {
-                eprintln!("netpeek: unknown argument '{a}' (try --help)");
-                std::process::exit(2);
-            }
+    let opts = match parse_opts(&args) {
+        Ok(o) => o,
+        Err(msg) => {
+            eprintln!("netpeek: {msg}");
+            std::process::exit(2);
         }
-        i += 1;
-    }
+    };
 
     let result = if args.iter().any(|a| a == "--diag") {
         run_diag(&opts)
@@ -90,6 +73,42 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+/// Parse the option flags into [`Opts`]; `Err` carries the message `main` prints
+/// before exiting 2. `--help` / `--version` are handled by the caller.
+fn parse_opts(args: &[String]) -> Result<Opts, String> {
+    // Mode flags consumed later via `args.iter().any(..)`; accepted as no-ops here.
+    let known_flags = ["--once", "--json", "--diag"];
+    let mut opts = Opts {
+        interval: DEFAULT_INTERVAL,
+        resolve: true,
+        mouse: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
+                    // The range check is also what rejects `inf` / `NaN`, which
+                    // parse fine and then panic inside `Duration::from_secs_f64`.
+                    Some(v) if (MIN_INTERVAL..=MAX_INTERVAL).contains(&v) => opts.interval = v,
+                    _ => {
+                        return Err(format!(
+                            "--interval needs a number of seconds between {MIN_INTERVAL} and {MAX_INTERVAL}"
+                        ))
+                    }
+                }
+            }
+            "--no-resolve" => opts.resolve = false,
+            "--mouse" => opts.mouse = true,
+            a if known_flags.contains(&a) => {}
+            a => return Err(format!("unknown argument '{a}' (try --help)")),
+        }
+        i += 1;
+    }
+    Ok(opts)
 }
 
 fn elevated() -> bool {
@@ -264,29 +283,37 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
     let interval = Duration::from_secs_f64(opts.interval);
 
     let mut terminal = ratatui::init();
-    // Mouse capture is opt-in: enabling it lets the wheel scroll the list but
-    // takes over the mouse, disabling the terminal's own text selection / copy.
-    if opts.mouse {
-        execute!(io::stdout(), EnableMouseCapture)?;
-    }
 
-    // Prime the pump: collect initial sources and request the first counts.
-    mon.drain()?;
-    mon.poll_counts()?;
-    let mut last_tick = Instant::now();
-    let mut last_update = clock_hms();
+    // Everything after ratatui::init() runs inside this closure so that the
+    // restore below is reached however it ends. init() turns on raw mode and the
+    // alternate screen but installs only a *panic* hook — an early `?` out here
+    // (EnableMouseCapture, or an ENOBUFS from the priming drain/poll) would drop
+    // the user back into a raw-mode shell needing `reset`.
+    let res = (|| -> io::Result<()> {
+        // Mouse capture is opt-in: enabling it lets the wheel scroll the list but
+        // takes over the mouse, disabling the terminal's own text selection / copy.
+        if opts.mouse {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        }
 
-    let res = run_loop(
-        &mut terminal,
-        &mut mon,
-        &services,
-        resolver.as_ref(),
-        &mut app,
-        opts,
-        interval,
-        &mut last_tick,
-        &mut last_update,
-    );
+        // Prime the pump: collect initial sources and request the first counts.
+        mon.drain()?;
+        mon.poll_counts()?;
+        let mut last_tick = Instant::now();
+        let mut last_update = clock_hms();
+
+        run_loop(
+            &mut terminal,
+            &mut mon,
+            &services,
+            resolver.as_ref(),
+            &mut app,
+            opts,
+            interval,
+            &mut last_tick,
+            &mut last_update,
+        )
+    })();
 
     if opts.mouse {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -482,7 +509,7 @@ OPTIONS:
     --once            One snapshot as a text table, then exit
     --json            One snapshot as a JSON array on stdout (pipe into jq)
     --diag            Connectivity + permission diagnostics
-    --interval SECS   Refresh / sampling interval (default 1.0, min 0.2)
+    --interval SECS   Refresh / sampling interval (default 1.0, 0.2 to 3600)
     --no-resolve      Skip reverse-DNS of remote hosts (TUI)
     --mouse           Capture the mouse for wheel-scroll (off by default, so
                       terminal text selection keeps working; keys still scroll)
@@ -511,6 +538,45 @@ mod tests {
     fn truncation_helper() {
         assert_eq!(trunc("short", 10), "short");
         assert_eq!(trunc("a-very-long-process-name", 8), "a-very-…");
+    }
+
+    fn opts_from(args: &[&str]) -> Result<Opts, String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_opts(&owned)
+    }
+
+    #[test]
+    fn parses_flags_and_defaults() {
+        let o = opts_from(&[]).unwrap();
+        assert_eq!(o.interval, DEFAULT_INTERVAL);
+        assert!(o.resolve);
+        assert!(!o.mouse);
+
+        let o = opts_from(&["--once", "--no-resolve", "--mouse", "--interval", "2.5"]).unwrap();
+        assert_eq!(o.interval, 2.5);
+        assert!(!o.resolve);
+        assert!(o.mouse);
+
+        assert!(opts_from(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn interval_rejects_values_duration_cannot_hold() {
+        // Every accepted interval is handed to Duration::from_secs_f64, which
+        // panics on a non-finite or out-of-range value; "inf"/"1e20" parse as
+        // valid f64s and used to sail past a bare `>= 0.2` check.
+        for bad in ["inf", "-inf", "nan", "1e20", "3601", "0.1", "-1", "abc", ""] {
+            let r = opts_from(&["--interval", bad]);
+            assert!(r.is_err(), "--interval {bad} should be rejected");
+        }
+        // a missing value is still an error, not a panic
+        assert!(opts_from(&["--interval"]).is_err());
+
+        for good in ["0.2", "1", "1.5", "3600"] {
+            let o = opts_from(&["--interval", good]).unwrap();
+            // the accepted range is exactly what Duration can represent
+            let _ = Duration::from_secs_f64(o.interval);
+        }
     }
 
     #[test]

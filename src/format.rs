@@ -28,6 +28,18 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
+/// Format a sampling interval in seconds for the status line. A plain `{:.0}`
+/// renders the whole supported sub-second range (`--interval` goes down to 0.2)
+/// as `"0"` and turns 1.5 into `"2"`, misreporting the window the displayed
+/// rates are averaged over — so keep a decimal unless the interval is whole.
+pub fn secs(seconds: f64) -> String {
+    if seconds.fract() == 0.0 {
+        format!("{seconds:.0}")
+    } else {
+        format!("{seconds:.1}")
+    }
+}
+
 /// `nstat_tcp_descriptor.state` → the BSD TCP FSM name (`netinet/tcp_fsm.h`).
 pub fn tcp_state(state: u32) -> &'static str {
     match state {
@@ -96,6 +108,18 @@ mod tests {
         assert_eq!(rate(2048.0), "2.0 KB/s");
         // negative (shouldn't happen) clamps to zero
         assert_eq!(rate(-5.0), "0 B/s");
+    }
+
+    #[test]
+    fn interval_seconds() {
+        // whole seconds stay whole
+        assert_eq!(secs(1.0), "1");
+        assert_eq!(secs(10.0), "10");
+        // the sub-second range `--interval` accepts must not collapse to "0"
+        assert_eq!(secs(0.2), "0.2");
+        assert_eq!(secs(0.5), "0.5");
+        // and a fractional interval isn't rounded to a different window
+        assert_eq!(secs(1.5), "1.5");
     }
 
     #[test]

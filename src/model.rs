@@ -645,17 +645,50 @@ mod tests {
         let mut e = Engine::new(3);
         e.on_added(1, Proto::Tcp);
         e.on_desc(1, Proto::Tcp, desc(1, "x", 80));
+        // A growing per-tick delta so every sample is distinguishable: tick i
+        // sees i*1000 more bytes than tick i-1, i.e. a rate of i*1000 B/s (the
+        // first tick only primes the baseline, so it records 0).
+        let mut cumulative = 0u64;
         for i in 1..=10u64 {
+            cumulative += i * 1000;
             e.on_counts(
                 1,
                 Counts {
-                    rx_bytes: i * 1000,
+                    rx_bytes: cumulative,
                     tx_bytes: 0,
                 },
             );
             e.tick(1.0);
         }
-        assert!(e.rows()[0].rx_hist.len() <= 3);
+        // 10 samples capped to the newest 3, oldest → newest.
+        assert_eq!(e.rows()[0].rx_hist, vec![8_000, 9_000, 10_000]);
+    }
+
+    #[test]
+    fn history_keeps_down_and_up_series_apart() {
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(100, "curl", 443));
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+        );
+        e.tick(1.0); // primes: records a zero sample in both series
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 1_000,
+                tx_bytes: 250,
+            },
+        );
+        e.tick(1.0);
+        // down history feeds the ↓ sparkline, up history the ↑ one — swapping
+        // them at the push site renders each trend in the other's column.
+        assert_eq!(e.rows()[0].rx_hist, vec![0, 1_000]);
+        assert_eq!(e.rows()[0].tx_hist, vec![0, 250]);
     }
 
     #[test]

@@ -20,8 +20,9 @@ use std::io;
 use crate::model::{Engine, Proto};
 use sys::ControlSocket;
 use wire::{
-    is_tcp_provider, is_udp_provider, parse_datagram, Msg, NstatMsgAddAllSrcs, NstatMsgSrcRefReq,
-    NSTAT_MSG_TYPE_GET_SRC_DESC, NSTAT_MSG_TYPE_QUERY_SRC, NSTAT_SRC_REF_ALL, SUBSCRIBED_PROVIDERS,
+    is_tcp_provider, is_udp_provider, parse_datagram, sanitize_name, Msg, NstatMsgAddAllSrcs,
+    NstatMsgSrcRefReq, NSTAT_MSG_TYPE_GET_SRC_DESC, NSTAT_MSG_TYPE_QUERY_SRC, NSTAT_SRC_REF_ALL,
+    SUBSCRIBED_PROVIDERS,
 };
 
 /// Descriptor requests sent per drain. Subscribing yields a burst of 100+
@@ -32,6 +33,23 @@ const DESC_BATCH: usize = 16;
 /// `ENOBUFS` — transient backpressure when a poll burst outruns the socket
 /// buffer. We recover on the next poll, so it isn't surfaced as a real error.
 const ENOBUFS: u32 = 55;
+
+/// Pop up to `batch` srcrefs to describe, discarding any that `live` no longer
+/// holds. A source can be added *and* removed inside one [`Monitor::drain`], and
+/// a `GET_SRC_DESC` for a torn-down source draws an `ENOENT` error reply — which
+/// would then surface in `--diag` as a kernel error on a perfectly healthy
+/// system. A discarded srcref doesn't consume the batch: nothing was sent for it.
+fn take_desc_batch(pending: &mut VecDeque<u64>, live: &HashSet<u64>, batch: usize) -> Vec<u64> {
+    let mut out = Vec::new();
+    while out.len() < batch {
+        match pending.pop_front() {
+            Some(srcref) if live.contains(&srcref) => out.push(srcref),
+            Some(_) => {} // retired before we got round to describing it
+            None => break,
+        }
+    }
+    out
+}
 
 fn proto_of(provider: u32) -> Option<Proto> {
     if is_tcp_provider(provider) {
@@ -48,7 +66,9 @@ pub struct Monitor {
     sock: ControlSocket,
     engine: Engine,
     buf: Vec<u8>,
-    /// srcrefs we've already asked the kernel to describe (once each).
+    /// srcrefs we've already asked the kernel to describe (once each) *and* that
+    /// are still live — `SRC_REMOVED` takes one back out, which is how a retired
+    /// srcref is kept out of the descriptor batch (see [`take_desc_batch`]).
     requested: HashSet<u64>,
     /// srcrefs awaiting a (paced) descriptor request.
     pending_desc: VecDeque<u64>,
@@ -110,11 +130,8 @@ impl Monitor {
 
     /// Fire up to [`DESC_BATCH`] queued descriptor requests.
     fn pump_desc_requests(&mut self) -> io::Result<()> {
-        for _ in 0..DESC_BATCH {
-            match self.pending_desc.pop_front() {
-                Some(srcref) => self.request_desc(srcref)?,
-                None => break,
-            }
+        for srcref in take_desc_batch(&mut self.pending_desc, &self.requested, DESC_BATCH) {
+            self.request_desc(srcref)?;
         }
         Ok(())
     }
@@ -137,7 +154,10 @@ impl Monitor {
                 if let Some(proto) = proto_of(provider) {
                     if desc.pname.is_empty() {
                         if let Some(name) = sys::proc_name(desc.pid) {
-                            desc.pname = name;
+                            // Sanitised like the kernel's own pname field: this
+                            // one is a filename, which may hold any byte but `/`
+                            // and NUL, and --once/--diag print it to a terminal.
+                            desc.pname = sanitize_name(&name);
                         }
                     }
                     self.engine.on_desc(srcref, proto, desc);
@@ -155,6 +175,8 @@ impl Monitor {
             }
             Msg::SrcRemoved { srcref } => {
                 self.engine.on_removed(srcref);
+                // Dropping it from `requested` also retires any descriptor
+                // request still queued for it (see `take_desc_batch`).
                 self.requested.remove(&srcref);
             }
             Msg::Error { code } if code == ENOBUFS => {} // transient, recovered next poll
@@ -182,5 +204,33 @@ impl Monitor {
     /// The last kernel-reported error code, if any (surfaced in `--diag`).
     pub fn last_error(&self) -> Option<u32> {
         self.last_error
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desc_batch_skips_sources_the_kernel_already_removed() {
+        // 2 was added and removed inside the same drain; asking for its
+        // descriptor would draw an ENOENT that `--diag` reports as a kernel
+        // error on an otherwise healthy system.
+        let mut pending: VecDeque<u64> = [1, 2, 3].into_iter().collect();
+        let live: HashSet<u64> = [1, 3].into_iter().collect();
+        assert_eq!(take_desc_batch(&mut pending, &live, DESC_BATCH), vec![1, 3]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn desc_batch_is_paced_and_skips_do_not_consume_it() {
+        let mut pending: VecDeque<u64> = (0u64..10).collect();
+        let live: HashSet<u64> = (0u64..10).filter(|n| n % 2 == 0).collect();
+        // three *sent* requests, even though six entries had to be popped
+        assert_eq!(take_desc_batch(&mut pending, &live, 3), vec![0, 2, 4]);
+        assert_eq!(pending.len(), 5);
+        // the rest follow on the next drain
+        assert_eq!(take_desc_batch(&mut pending, &live, 3), vec![6, 8]);
+        assert!(pending.is_empty());
     }
 }

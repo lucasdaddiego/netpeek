@@ -325,6 +325,18 @@ pub fn parse_sockaddr(buf: &[u8], off: usize) -> Option<Endpoint> {
     }
 }
 
+/// Neutralise control characters in a process name so a hostile one can't
+/// smuggle terminal escapes into the UI (`--once` / `--diag` print names
+/// straight to stdout). Every name that reaches a [`FlowDesc`] goes through
+/// here — the kernel's `pname` field via [`parse_pname`], and the
+/// `proc_pidpath` fallback in [`super::Monitor::apply`], since a macOS filename
+/// may hold any byte but `/` and NUL.
+pub fn sanitize_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
 /// Decode a NUL-terminated, fixed-width process name field, stripping control
 /// bytes so a hostile name can't smuggle terminal escapes into the UI.
 fn parse_pname(buf: &[u8], off: usize) -> String {
@@ -333,10 +345,7 @@ fn parse_pname(buf: &[u8], off: usize) -> String {
         None => buf.get(off..).unwrap_or(&[]),
     };
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    String::from_utf8_lossy(&raw[..end])
-        .chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
+    sanitize_name(&String::from_utf8_lossy(&raw[..end]))
 }
 
 /// True if a decoded descriptor looks real: a plausible pid and at least one
@@ -501,6 +510,56 @@ mod tests {
         assert_eq!(q.srcref, u64::MAX);
     }
 
+    // The by-name assertions above (and the size ones) are layout-independent:
+    // swapping two same-size fields keeps them green while the kernel reads a
+    // different field at each offset and rejects the request. These pin the
+    // bytes that actually go on the wire, at the offsets `nstat_msg_add_all_srcs`
+    // / `nstat_msg_query_src` define.
+    #[test]
+    fn add_all_srcs_serialises_to_the_kernel_layout() {
+        let m = NstatMsgAddAllSrcs::new(7, NSTAT_PROVIDER_TCP_KERNEL);
+        let b = bytemuck::bytes_of(&m);
+        assert_eq!(b.len(), 56);
+        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 7); // hdr.context
+        assert_eq!(
+            u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            NSTAT_MSG_TYPE_ADD_ALL_SRCS
+        );
+        assert_eq!(u16::from_le_bytes(b[12..14].try_into().unwrap()), 56); // hdr.length
+        assert_eq!(
+            u16::from_le_bytes(b[14..16].try_into().unwrap()),
+            NSTAT_MSG_HDR_FLAG_SUPPORTS_AGGREGATE
+        );
+        assert_eq!(
+            u64::from_le_bytes(b[16..24].try_into().unwrap()),
+            NSTAT_FILTER_FLAGS_V1_USAGE
+        );
+        assert_eq!(u64::from_le_bytes(b[24..32].try_into().unwrap()), 0); // events
+        assert_eq!(
+            u32::from_le_bytes(b[32..36].try_into().unwrap()),
+            NSTAT_PROVIDER_TCP_KERNEL
+        );
+        assert_eq!(i32::from_le_bytes(b[36..40].try_into().unwrap()), -1); // target_pid
+        assert_eq!(&b[40..56], &[0u8; 16]); // target_uuid
+    }
+
+    #[test]
+    fn srcref_req_serialises_to_the_kernel_layout() {
+        let q = NstatMsgSrcRefReq::new(1, NSTAT_MSG_TYPE_GET_SRC_DESC, 0xDEAD_BEEF);
+        let b = bytemuck::bytes_of(&q);
+        assert_eq!(b.len(), 24);
+        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 1); // hdr.context
+        assert_eq!(
+            u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            NSTAT_MSG_TYPE_GET_SRC_DESC
+        );
+        assert_eq!(u16::from_le_bytes(b[12..14].try_into().unwrap()), 24); // hdr.length
+        assert_eq!(
+            u64::from_le_bytes(b[16..24].try_into().unwrap()),
+            0xDEAD_BEEF
+        ); // srcref
+    }
+
     #[test]
     fn provider_classification() {
         assert!(is_tcp_provider(NSTAT_PROVIDER_TCP_KERNEL));
@@ -543,7 +602,9 @@ mod tests {
         let v6 = v6_sockaddr(ip6, 53);
         let ep = parse_sockaddr(&v6, 0).unwrap();
         assert_eq!(ep.port, 53);
-        assert!(matches!(ep.ip, IpAddr::V6(_)));
+        // the exact address, not just "some V6": reading the 16 bytes from the
+        // wrong offset still yields a non-unspecified V6 address.
+        assert_eq!(ep.ip, IpAddr::V6(Ipv6Addr::from(ip6)));
 
         // unspecified 0.0.0.0:0 → None
         assert!(parse_sockaddr(&v4_sockaddr([0, 0, 0, 0], 0), 0).is_none());
@@ -570,6 +631,18 @@ mod tests {
     fn parse_desc_rejects_unknown_provider() {
         // a provider that's neither TCP nor UDP yields no descriptor
         assert!(parse_desc(999, &[0u8; TCP_MIN_LEN]).is_none());
+    }
+
+    #[test]
+    fn sanitize_name_neutralises_control_characters() {
+        // Also the chokepoint for the `proc_pidpath` fallback in `Monitor::apply`:
+        // a macOS filename may hold any byte but `/` and NUL, and `--once` /
+        // `--diag` print the name straight to the terminal.
+        assert_eq!(sanitize_name("curl"), "curl");
+        assert_eq!(sanitize_name("\u{1b}[2Jx"), "\u{fffd}[2Jx");
+        assert_eq!(sanitize_name("a\u{7}b\nc"), "a\u{fffd}b\u{fffd}c");
+        // printable Unicode is untouched
+        assert_eq!(sanitize_name("café ✓"), "café ✓");
     }
 
     #[test]

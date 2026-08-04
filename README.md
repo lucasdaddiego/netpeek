@@ -131,7 +131,7 @@ netpeek --help            # usage summary
 | `--once` | Single text-table snapshot (two samples for a real rate), then exit. |
 | `--json` | Single snapshot as a JSON array, sorted by rate, keys alphabetised. |
 | `--diag` | Print socket connectivity, privilege, flow/process counts and top talkers. |
-| `--interval SECS` | Refresh and rate-sampling interval (default `1.0`, minimum `0.2`). |
+| `--interval SECS` | Refresh and rate-sampling interval (default `1.0`, `0.2`–`3600`). |
 | `--no-resolve` | Skip reverse DNS; the detail pane shows raw IPs. |
 | `--mouse` | Capture the mouse so the wheel scrolls the list. Off by default, so the terminal's own text selection / copy keeps working (the keys scroll regardless). |
 | `--version`, `-V` | Print version. |

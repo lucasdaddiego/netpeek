@@ -91,7 +91,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, status: &StatusInfo) {
             format!("{}{arrow}", app.sort.label()),
             Style::default().fg(C_ACCENT),
         ),
-        Span::raw(format!("  every {:.0}s", status.interval_secs)),
+        Span::raw(format!("  every {}s", format::secs(status.interval_secs))),
     ];
     if app.paused {
         spans.push(Span::styled(
