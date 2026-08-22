@@ -456,29 +456,39 @@ pub fn parse_message(msg_type: u32, msg: &[u8]) -> Option<Msg> {
 
 /// Walk a datagram that may pack several `nstat_msg_hdr`-prefixed messages
 /// back-to-back (the kernel "aggregates"), decoding each in turn. A truncated
-/// or zero-length trailing message stops the walk cleanly.
-pub fn parse_datagram(buf: &[u8]) -> Vec<Msg> {
-    let mut out = Vec::new();
+/// or zero-length trailing message stops the walk cleanly. Lazy: the socket
+/// loop applies each message as it's decoded, with no per-datagram `Vec`.
+pub fn parse_datagram(buf: &[u8]) -> impl Iterator<Item = Msg> + '_ {
+    const HDR: usize = std::mem::size_of::<NstatMsgHdr>();
     let mut off = 0usize;
-    while off + std::mem::size_of::<NstatMsgHdr>() <= buf.len() {
-        // pod_read_unaligned copies the 16 header bytes into an aligned struct,
-        // so the walk doesn't depend on `off` happening to be 8-aligned.
-        let hdr: NstatMsgHdr = bytemuck::pod_read_unaligned(&buf[off..off + 16]);
-        let len = hdr.length as usize;
-        if len < std::mem::size_of::<NstatMsgHdr>() || off + len > buf.len() {
-            break;
+    std::iter::from_fn(move || {
+        loop {
+            if off + HDR > buf.len() {
+                return None;
+            }
+            // pod_read_unaligned copies the 16 header bytes into an aligned
+            // struct, so the walk doesn't depend on `off` being 8-aligned.
+            let hdr: NstatMsgHdr = bytemuck::pod_read_unaligned(&buf[off..off + HDR]);
+            let len = hdr.length as usize;
+            if len < HDR || off + len > buf.len() {
+                return None;
+            }
+            let msg = &buf[off..off + len];
+            off += len;
+            if let Some(m) = parse_message(hdr.msg_type, msg) {
+                return Some(m);
+            }
         }
-        if let Some(m) = parse_message(hdr.msg_type, &buf[off..off + len]) {
-            out.push(m);
-        }
-        off += len;
-    }
-    out
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_datagram(buf: &[u8]) -> Vec<Msg> {
+        super::parse_datagram(buf).collect()
+    }
 
     // Sizes must match the C structs exactly or the kernel rejects our requests.
     #[test]

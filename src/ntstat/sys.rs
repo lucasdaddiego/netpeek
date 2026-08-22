@@ -6,37 +6,17 @@
 use std::io;
 use std::os::unix::io::RawFd;
 
-use libc::{c_void, close, connect, fcntl, ioctl, recv, send, socket};
+// The kernel-control types and constants (`ctl_info`, `sockaddr_ctl`,
+// `CTLIOCGINFO`, `PF_SYSTEM`, `SYSPROTO_CONTROL`, `AF_SYS_CONTROL`) and
+// `proc_pidpath` all come from the libc crate's Apple bindings — nothing is
+// hand-transcribed here.
+use libc::{
+    AF_SYS_CONTROL, CTLIOCGINFO, MAX_KCTL_NAME, PF_SYSTEM, PROC_PIDPATHINFO_MAXSIZE,
+    SYSPROTO_CONTROL, c_void, close, connect, ctl_info, fcntl, ioctl, proc_pidpath, recv, send,
+    sockaddr_ctl, socket,
+};
 
 use super::wire::CONTROL_NAME;
-
-// PF_SYSTEM / AF_SYSTEM domain for kernel control sockets.
-const PF_SYSTEM: libc::c_int = 32;
-const SYSPROTO_CONTROL: libc::c_int = 2;
-const AF_SYS_CONTROL: u16 = 2;
-const MAX_KCTL_NAME: usize = 96;
-
-// CTLIOCGINFO = _IOWR('N', 3, struct ctl_info).
-//   _IOWR(g,n,t) = IOC_INOUT | ((sizeof(t) & IOCPARM_MASK) << 16) | (g<<8) | n
-// with IOC_INOUT = 0xC0000000, IOCPARM_MASK = 0x1fff, 'N' = 0x4e, and
-// sizeof(struct ctl_info) = 4 + 96 = 100 → 0xC0644E03.
-const CTLIOCGINFO: libc::c_ulong = 0xC064_4E03;
-
-#[repr(C)]
-struct CtlInfo {
-    ctl_id: u32,
-    ctl_name: [u8; MAX_KCTL_NAME],
-}
-
-#[repr(C)]
-struct SockaddrCtl {
-    sc_len: u8,
-    sc_family: u8,
-    ss_sysaddr: u16,
-    sc_id: u32,
-    sc_unit: u32,
-    sc_reserved: [u32; 5],
-}
 
 /// An owned, connected, non-blocking ntstat control socket.
 pub struct ControlSocket {
@@ -60,32 +40,30 @@ impl ControlSocket {
         sock.set_rcvbuf(8 * 1024 * 1024);
 
         // Resolve the control id by name.
-        let mut info = CtlInfo {
-            ctl_id: 0,
-            ctl_name: [0u8; MAX_KCTL_NAME],
-        };
-        let name = CONTROL_NAME;
-        info.ctl_name[..name.len()].copy_from_slice(name);
+        // SAFETY: zeroed ctl_info is a valid all-zero POD value.
+        let mut info: ctl_info = unsafe { std::mem::zeroed() };
+        const _: () = assert!(CONTROL_NAME.len() < MAX_KCTL_NAME, "control name must fit");
+        for (dst, &src) in info.ctl_name.iter_mut().zip(CONTROL_NAME) {
+            *dst = src as libc::c_char;
+        }
         // SAFETY: ioctl with a correctly-sized in/out struct for CTLIOCGINFO.
-        if unsafe { ioctl(fd, CTLIOCGINFO, &mut info as *mut CtlInfo) } < 0 {
+        if unsafe { ioctl(fd, CTLIOCGINFO, &mut info as *mut ctl_info) } < 0 {
             return Err(io::Error::last_os_error());
         }
 
         // connect() via sockaddr_ctl with the resolved id.
-        let addr = SockaddrCtl {
-            sc_len: std::mem::size_of::<SockaddrCtl>() as u8,
-            sc_family: PF_SYSTEM as u8,
-            ss_sysaddr: AF_SYS_CONTROL,
-            sc_id: info.ctl_id,
-            sc_unit: 0,
-            sc_reserved: [0; 5],
-        };
+        // SAFETY: zeroed sockaddr_ctl is a valid all-zero POD value.
+        let mut addr: sockaddr_ctl = unsafe { std::mem::zeroed() };
+        addr.sc_len = std::mem::size_of::<sockaddr_ctl>() as u8;
+        addr.sc_family = PF_SYSTEM as u8;
+        addr.ss_sysaddr = AF_SYS_CONTROL as u16;
+        addr.sc_id = info.ctl_id;
         // SAFETY: connect with a sockaddr_ctl of the declared length.
         let rc = unsafe {
             connect(
                 fd,
-                &addr as *const SockaddrCtl as *const libc::sockaddr,
-                std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
+                &addr as *const sockaddr_ctl as *const libc::sockaddr,
+                std::mem::size_of::<sockaddr_ctl>() as libc::socklen_t,
             )
         };
         if rc < 0 {
@@ -167,11 +145,6 @@ impl Drop for ControlSocket {
     }
 }
 
-extern "C" {
-    // libproc (part of libSystem, no extra link flag): full executable path.
-    fn proc_pidpath(pid: libc::c_int, buf: *mut c_void, size: u32) -> libc::c_int;
-}
-
 /// The executable's file name for `pid` via `proc_pidpath`, used to name a flow
 /// when the kernel's own `pname` field (a 64-byte slot, filled from the process's
 /// short name) comes back empty. `None` if the process is gone or not
@@ -180,9 +153,9 @@ pub fn proc_name(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
-    let mut buf = [0u8; 4096];
-    // SAFETY: proc_pidpath writes at most `size` bytes into buf and returns the
-    // length (0 on failure).
+    let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath (libproc, part of libSystem) writes at most `size`
+    // bytes into buf and returns the length (0 on failure).
     let n = unsafe {
         proc_pidpath(
             pid as libc::c_int,

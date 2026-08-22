@@ -1,8 +1,8 @@
 [package]
 name = "netpeek"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.74"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "Live per-process network bandwidth TUI for macOS — real pid-attributed rates and flows from the same private kernel interface nettop uses, no sudo, no packet capture."
 repository = "https://github.com/lucasdaddiego/netpeek"
@@ -17,7 +17,9 @@ path = "src/main.rs"
 [dependencies]
 # TUI + terminal. crossterm is re-exported by ratatui (ratatui::crossterm), so we
 # never pin it separately — there's only ever one crossterm in the tree.
-ratatui = "0.30"
+# Default features pull in the calendar widget (and the `time` crate), the
+# layout cache and the declarative macros, none of which netpeek uses.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 # Raw socket / ioctl / getnameinfo syscalls.
 libc = "0.2"
 # Safe, checked casting of the kernel's #[repr(C)] wire structs to/from bytes.

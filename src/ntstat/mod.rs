@@ -20,9 +20,9 @@ use std::io;
 use crate::model::{Engine, Proto};
 use sys::ControlSocket;
 use wire::{
-    is_tcp_provider, is_udp_provider, parse_datagram, sanitize_name, Msg, NstatMsgAddAllSrcs,
-    NstatMsgSrcRefReq, NSTAT_MSG_TYPE_GET_SRC_DESC, NSTAT_MSG_TYPE_QUERY_SRC, NSTAT_SRC_REF_ALL,
-    SUBSCRIBED_PROVIDERS,
+    Msg, NSTAT_MSG_TYPE_GET_SRC_DESC, NSTAT_MSG_TYPE_QUERY_SRC, NSTAT_SRC_REF_ALL,
+    NstatMsgAddAllSrcs, NstatMsgSrcRefReq, SUBSCRIBED_PROVIDERS, is_tcp_provider, is_udp_provider,
+    parse_datagram, sanitize_name,
 };
 
 /// Descriptor requests sent per drain. Subscribing yields a burst of 100+
@@ -114,18 +114,27 @@ impl Monitor {
     /// Read and apply every datagram currently pending (non-blocking), then
     /// send the next paced batch of descriptor requests.
     pub fn drain(&mut self) -> io::Result<()> {
-        loop {
-            match self.sock.recv_into(&mut self.buf)? {
-                None => break,
-                Some(n) => {
-                    for msg in parse_datagram(&self.buf[..n]) {
-                        self.apply(msg);
-                    }
+        // The parser borrows the buffer lazily while `apply` needs `&mut self`,
+        // so lend the buffer out for the duration (a pointer move, no realloc).
+        let mut buf = std::mem::take(&mut self.buf);
+        let res = (|| -> io::Result<()> {
+            while let Some(n) = self.sock.recv_into(&mut buf)? {
+                for msg in parse_datagram(&buf[..n]) {
+                    self.apply(msg);
                 }
             }
-        }
-        self.pump_desc_requests()?;
-        Ok(())
+            Ok(())
+        })();
+        self.buf = buf;
+        res?;
+        self.pump_desc_requests()
+    }
+
+    /// Descriptor requests still queued (paced out [`DESC_BATCH`] per drain).
+    /// The one-shot modes wait for this to reach zero before sampling, so every
+    /// flow is named — not just the first few batches' worth.
+    pub fn pending_desc(&self) -> usize {
+        self.pending_desc.len()
     }
 
     /// Fire up to [`DESC_BATCH`] queued descriptor requests.
@@ -152,13 +161,13 @@ impl Monitor {
                 mut desc,
             } => {
                 if let Some(proto) = proto_of(provider) {
-                    if desc.pname.is_empty() {
-                        if let Some(name) = sys::proc_name(desc.pid) {
-                            // Sanitised like the kernel's own pname field: this
-                            // one is a filename, which may hold any byte but `/`
-                            // and NUL, and --once/--diag print it to a terminal.
-                            desc.pname = sanitize_name(&name);
-                        }
+                    if desc.pname.is_empty()
+                        && let Some(name) = sys::proc_name(desc.pid)
+                    {
+                        // Sanitised like the kernel's own pname field: this one
+                        // is a filename, which may hold any byte but `/` and
+                        // NUL, and --once/--diag print it to a terminal.
+                        desc.pname = sanitize_name(&name);
                     }
                     self.engine.on_desc(srcref, proto, desc);
                 }

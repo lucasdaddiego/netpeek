@@ -40,18 +40,20 @@ impl Resolver {
             let worker_rx: Arc<Mutex<Receiver<IpAddr>>> = Arc::clone(&rx);
             thread::Builder::new()
                 .name(format!("netpeek-dns-{n}"))
-                .spawn(move || loop {
-                    // Hold the lock only for the blocking recv handoff; resolve
-                    // outside it so the workers run getnameinfo concurrently and
-                    // a slow lookup occupies just one of them.
-                    let ip = {
-                        let guard = worker_rx.lock().unwrap();
-                        guard.recv()
-                    };
-                    let Ok(ip) = ip else { break }; // sender dropped → shut down
-                    let name = reverse_dns(ip);
-                    worker_cache.lock().unwrap().insert(ip, name);
-                    worker_inflight.lock().unwrap().remove(&ip);
+                .spawn(move || {
+                    loop {
+                        // Hold the lock only for the blocking recv handoff; resolve
+                        // outside it so the workers run getnameinfo concurrently and
+                        // a slow lookup occupies just one of them.
+                        let ip = {
+                            let guard = worker_rx.lock().unwrap();
+                            guard.recv()
+                        };
+                        let Ok(ip) = ip else { break }; // sender dropped → shut down
+                        let name = reverse_dns(ip);
+                        worker_cache.lock().unwrap().insert(ip, name);
+                        worker_inflight.lock().unwrap().remove(&ip);
+                    }
                 })
                 .expect("spawn dns worker");
         }
@@ -110,11 +112,7 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
     let s = unsafe { CStr::from_ptr(host.as_ptr()) }
         .to_string_lossy()
         .into_owned();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Marshal a `SocketAddr` into a C `sockaddr_storage` + length.

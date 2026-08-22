@@ -5,6 +5,8 @@
 //! wants: a per-process table (rates derived from counter deltas, plus up/down
 //! history for sparklines) and, on demand, the flows belonging to a process.
 
+use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 
 use crate::ntstat::wire::{Counts, Endpoint, FlowDesc};
@@ -192,12 +194,16 @@ impl Engine {
         f.described = true;
     }
 
-    /// Fresh cumulative counters for a flow.
+    /// Fresh cumulative counters for a flow. Counts for a srcref we don't track
+    /// are dropped: the kernel announces every source (`SRC_ADDED`) before it
+    /// reports on it, so an unknown srcref here is a late reply for a source
+    /// that's already been removed — creating a flow for it would leave a
+    /// zombie that's never described and never retired.
     pub fn on_counts(&mut self, srcref: u64, counts: Counts) {
-        // proto unknown here; default is corrected by on_added/on_desc.
-        let f = self.flow_mut(srcref, Proto::Tcp);
-        f.rx_bytes = counts.rx_bytes;
-        f.tx_bytes = counts.tx_bytes;
+        if let Some(f) = self.flows.get_mut(&srcref) {
+            f.rx_bytes = counts.rx_bytes;
+            f.tx_bytes = counts.tx_bytes;
+        }
     }
 
     /// A bundled update (counts + optional descriptor) — defensive path.
@@ -211,12 +217,13 @@ impl Engine {
     /// A source went away. Its final byte counts are carried onto the owning pid
     /// so the process's TOTAL stays monotonic while it still has other flows.
     pub fn on_removed(&mut self, srcref: u64) {
-        if let Some(f) = self.flows.remove(&srcref) {
-            if f.described && f.pid != 0 {
-                let carry = self.retired.entry(f.pid).or_insert((0, 0));
-                carry.0 = carry.0.saturating_add(f.rx_bytes);
-                carry.1 = carry.1.saturating_add(f.tx_bytes);
-            }
+        if let Some(f) = self.flows.remove(&srcref)
+            && f.described
+            && f.pid != 0
+        {
+            let carry = self.retired.entry(f.pid).or_insert((0, 0));
+            carry.0 = carry.0.saturating_add(f.rx_bytes);
+            carry.1 = carry.1.saturating_add(f.tx_bytes);
         }
     }
 
@@ -340,13 +347,13 @@ impl Engine {
     }
 
     /// All described flows belonging to `pid`, sorted by combined rate desc then
-    /// remote port — for the expanded detail view.
-    pub fn flows_for(&self, pid: u32) -> Vec<Flow> {
-        let mut v: Vec<Flow> = self
+    /// remote port — for the expanded detail view. Borrowed, not cloned: the
+    /// detail pane is rebuilt on every redraw.
+    pub fn flows_for(&self, pid: u32) -> Vec<&Flow> {
+        let mut v: Vec<&Flow> = self
             .flows
             .values()
             .filter(|f| f.described && f.pid == pid)
-            .cloned()
             .collect();
         v.sort_by(|a, b| {
             (b.rx_rate + b.tx_rate)
@@ -368,12 +375,16 @@ impl Engine {
 
 /// Sort rows in place by `key`. `descending` flips the order; `Name` sorts
 /// case-insensitively. Ties always break by pid for a stable, jitter-free table.
-pub fn sort_rows(rows: &mut [ProcRow], key: SortKey, descending: bool) {
+///
+/// Generic over owned rows (`[ProcRow]`) and borrowed ones (`[&ProcRow]`) so
+/// the render loop can sort a filtered view without cloning every row.
+pub fn sort_rows<R: Borrow<ProcRow>>(rows: &mut [R], key: SortKey, descending: bool) {
     rows.sort_by(|a, b| {
+        let (a, b) = (a.borrow(), b.borrow());
         let ord = match key {
             SortKey::Rate => a.total_rate().total_cmp(&b.total_rate()),
             SortKey::Total => a.total_bytes().cmp(&b.total_bytes()),
-            SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortKey::Name => cmp_ignore_case(&a.name, &b.name),
             SortKey::Conns => a.conns.cmp(&b.conns),
             SortKey::Pid => a.pid.cmp(&b.pid),
         };
@@ -382,14 +393,45 @@ pub fn sort_rows(rows: &mut [ProcRow], key: SortKey, descending: bool) {
     });
 }
 
-/// Case-insensitive match of a process row against a filter string (matches the
-/// name or the pid). An empty filter matches everything.
-pub fn matches_filter(row: &ProcRow, filter: &str) -> bool {
-    if filter.is_empty() {
-        return true;
+/// Case-insensitive ordering without allocating (a sort makes O(n log n)
+/// comparisons per frame; two `to_lowercase()` Strings each would dominate).
+fn cmp_ignore_case(a: &str, b: &str) -> Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
+/// A prepared process filter: the query lowercased once, so matching a row is
+/// a plain substring test. Matches the process name (case-insensitively) or the
+/// pid; an empty filter matches everything.
+pub struct Filter {
+    query: String,
+    /// Only an all-digit query can be (part of) a pid, so a non-numeric one
+    /// skips the pid test — and its `to_string` — per row.
+    numeric: bool,
+}
+
+impl Filter {
+    pub fn new(query: &str) -> Self {
+        Filter {
+            query: query.to_lowercase(),
+            numeric: !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()),
+        }
     }
-    let f = filter.to_lowercase();
-    row.name.to_lowercase().contains(&f) || row.pid.to_string().contains(&f)
+
+    pub fn is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    pub fn matches(&self, row: &ProcRow) -> bool {
+        if self.query.is_empty() {
+            return true;
+        }
+        if row.name.to_lowercase().contains(&self.query) {
+            return true;
+        }
+        self.numeric && row.pid.to_string().contains(&self.query)
+    }
 }
 
 #[cfg(test)]
@@ -483,7 +525,7 @@ mod tests {
             },
         );
         e.tick(1.0); // prime first
-                     // a primed flow ticked with dt == 0 must not divide by zero
+        // a primed flow ticked with dt == 0 must not divide by zero
         e.on_counts(
             1,
             Counts {
@@ -626,7 +668,7 @@ mod tests {
         e.on_removed(1);
         e.tick(1.0);
         assert!(e.rows().is_empty()); // no live flows → process leaves the table
-                                      // a fresh flow for the same pid starts from zero, not 5_000 (no stale carry)
+        // a fresh flow for the same pid starts from zero, not 5_000 (no stale carry)
         e.on_added(2, Proto::Tcp);
         e.on_desc(2, Proto::Tcp, desc(50, "x", 443));
         e.on_counts(
@@ -860,11 +902,51 @@ mod tests {
     #[test]
     fn filtering_by_name_and_pid() {
         let r = row(1234, "Firefox", 0.0, 0, 0);
-        assert!(matches_filter(&r, ""));
-        assert!(matches_filter(&r, "fire"));
-        assert!(matches_filter(&r, "FOX"));
-        assert!(matches_filter(&r, "123"));
-        assert!(!matches_filter(&r, "chrome"));
+        assert!(Filter::new("").matches(&r));
+        assert!(Filter::new("").is_empty());
+        assert!(Filter::new("fire").matches(&r));
+        assert!(Filter::new("FOX").matches(&r));
+        assert!(Filter::new("123").matches(&r));
+        assert!(!Filter::new("chrome").matches(&r));
+        // a digit-only query still matches a name containing those digits
+        let r = row(7, "Chrome Helper 42", 0.0, 0, 0);
+        assert!(Filter::new("42").matches(&r));
+        assert!(!Filter::new("43").matches(&r));
+    }
+
+    #[test]
+    fn name_sort_is_case_insensitive_and_unicode_aware() {
+        assert_eq!(cmp_ignore_case("apple", "Banana"), Ordering::Less);
+        assert_eq!(cmp_ignore_case("Zsh", "apple"), Ordering::Greater);
+        assert_eq!(cmp_ignore_case("ÉCLAIR", "éclair"), Ordering::Equal);
+        assert_eq!(cmp_ignore_case("ab", "abc"), Ordering::Less);
+    }
+
+    #[test]
+    fn sort_rows_works_on_borrowed_rows() {
+        let owned = [row(2, "b", 1.0, 0, 0), row(1, "a", 2.0, 0, 0)];
+        let mut view: Vec<&ProcRow> = owned.iter().collect();
+        sort_rows(&mut view, SortKey::Rate, true);
+        assert_eq!(view[0].pid, 1);
+    }
+
+    #[test]
+    fn counts_for_an_unknown_srcref_do_not_create_a_zombie_flow() {
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(9, "x", 80));
+        e.on_removed(1);
+        // a late SRC_COUNTS for the removed source must not resurrect it
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 100,
+                tx_bytes: 0,
+            },
+        );
+        assert_eq!(e.flow_count(), 0);
+        e.tick(1.0);
+        assert!(e.rows().is_empty());
     }
 
     #[test]

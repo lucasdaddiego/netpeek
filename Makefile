@@ -12,11 +12,13 @@ ARGS        ?=
 COV_EXCLUDE := --ignore-filename-regex 'src/(ui|dns|main)\.rs|src/ntstat/(sys|mod)\.rs'
 COV_MIN     := 99
 
-# cargo-llvm-cov needs llvm-tools. Homebrew's Rust ships none, so when the brew
-# `llvm` keg has them, point the tool there; otherwise fall back to whatever's on
-# PATH (rustup's llvm-tools-preview, as CI uses). Resolves to an env prefix or "".
+# cargo-llvm-cov needs llvm-tools. Homebrew's Rust ships none, so point the tool
+# at the brew `llvm` keg if it has them, else at Xcode's Command Line Tools
+# (`xcrun`), else fall back to whatever's on PATH (rustup's llvm-tools-preview,
+# as CI uses). Resolves to an env prefix or "".
 BREW_LLVM := $(shell brew --prefix llvm 2>/dev/null)/bin
-LLVM_ENV  := $(if $(wildcard $(BREW_LLVM)/llvm-cov),LLVM_COV="$(BREW_LLVM)/llvm-cov" LLVM_PROFDATA="$(BREW_LLVM)/llvm-profdata",)
+XCRUN_COV := $(shell xcrun -f llvm-cov 2>/dev/null)
+LLVM_ENV  := $(if $(wildcard $(BREW_LLVM)/llvm-cov),LLVM_COV="$(BREW_LLVM)/llvm-cov" LLVM_PROFDATA="$(BREW_LLVM)/llvm-profdata",$(if $(XCRUN_COV),LLVM_COV="$(XCRUN_COV)" LLVM_PROFDATA="$(dir $(XCRUN_COV))llvm-profdata",))
 
 .DEFAULT_GOAL := install
 .PHONY: install run diag fmt lint test coverage cov-html check clean help

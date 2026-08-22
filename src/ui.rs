@@ -1,11 +1,11 @@
 //! ratatui rendering. All terminal-bound; the logic it draws (sorting,
 //! filtering, formatting, sparklines) lives in the tested pure modules.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
-use ratatui::Frame;
 
 use crate::app::{App, Mode};
 use crate::dns::Resolver;
@@ -14,12 +14,28 @@ use crate::model::{Flow, ProcRow, SortKey};
 use crate::services::Services;
 
 /// Status-line facts the render loop hands in each frame.
-pub struct StatusInfo {
-    pub proc_count: usize,
+pub struct StatusInfo<'a> {
+    /// Rows after the filter / rows before it (equal when unfiltered).
+    pub shown_procs: usize,
+    pub total_procs: usize,
     pub flow_count: usize,
+    /// Machine-wide down / up throughput across every process (bytes/sec).
+    pub rx_rate: f64,
+    pub tx_rate: f64,
     pub interval_secs: f64,
-    pub last_update: String,
+    pub last_update: &'a str,
     pub elevated: bool,
+}
+
+/// Everything one frame renders from, borrowed from the render loop.
+pub struct View<'a> {
+    /// Visible process rows, already filtered and sorted.
+    pub rows: &'a [&'a ProcRow],
+    /// Flows of the expanded process (empty when none is expanded).
+    pub flows: &'a [&'a Flow],
+    pub services: &'a Services,
+    pub resolver: Option<&'a Resolver>,
+    pub status: StatusInfo<'a>,
 }
 
 const C_DOWN: Color = Color::Green;
@@ -32,17 +48,14 @@ const C_ACCENT: Color = Color::Yellow;
 /// `table_state` is owned by the render loop and reused across frames so the
 /// table's scroll offset persists — otherwise a fresh state each frame resets
 /// the offset to 0 and the selection gets pinned to the bottom of long lists.
-#[allow(clippy::too_many_arguments)]
-pub fn draw(
-    f: &mut Frame,
-    app: &App,
-    rows: &[ProcRow],
-    flows: &[Flow],
-    services: &Services,
-    resolver: Option<&Resolver>,
-    status: &StatusInfo,
-    table_state: &mut TableState,
-) {
+pub fn draw(f: &mut Frame, app: &App, view: &View, table_state: &mut TableState) {
+    let View {
+        rows,
+        flows,
+        services,
+        resolver,
+        status,
+    } = view;
     let show_detail = app.expanded.is_some() && !flows.is_empty();
     let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
     if show_detail {
@@ -58,7 +71,7 @@ pub fn draw(
     draw_status(f, chunks[0], app, status);
     draw_table(f, chunks[1], app, rows, table_state);
     if show_detail {
-        draw_detail(f, chunks[2], app, flows, services, resolver);
+        draw_detail(f, chunks[2], app, flows, services, *resolver);
         draw_footer(f, chunks[3], app);
     } else {
         draw_footer(f, chunks[2], app);
@@ -77,14 +90,30 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, status: &StatusInfo) {
             Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
+        // Bold default fg, not a fixed white: white is unreadable on a light
+        // terminal theme.
         Span::styled(
-            format!("{} procs", status.proc_count),
-            Style::default().fg(Color::White),
+            if status.shown_procs == status.total_procs {
+                format!("{} procs", status.total_procs)
+            } else {
+                format!("{}/{} procs", status.shown_procs, status.total_procs)
+            },
+            Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             format!("{} flows", status.flow_count),
             Style::default().fg(C_DIM),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("↓ {}", format::rate(status.rx_rate)),
+            Style::default().fg(C_DOWN),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("↑ {}", format::rate(status.tx_rate)),
+            Style::default().fg(C_UP),
         ),
         Span::raw("  sort "),
         Span::styled(
@@ -123,7 +152,7 @@ fn wide(area: Rect) -> bool {
     area.width >= 92
 }
 
-fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[ProcRow], state: &mut TableState) {
+fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[&ProcRow], state: &mut TableState) {
     let show_spark = wide(area);
 
     let mark = |key: SortKey, base: &str| -> String {
@@ -154,15 +183,13 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[ProcRow], state: &mu
     let body: Vec<Row> = rows
         .iter()
         .map(|r| {
-            let name = format!(
-                "{} {}",
-                if app.expanded == Some(r.pid) {
-                    "▾"
-                } else {
-                    "▸"
-                },
-                r.name
-            );
+            // Only the expanded row carries a marker; a `▸` on every line is
+            // noise that hides the one that matters.
+            let name = if app.expanded == Some(r.pid) {
+                format!("▾ {}", r.name)
+            } else {
+                format!("  {}", r.name)
+            };
             let mut cells = vec![
                 Cell::from(right(r.pid.to_string())),
                 Cell::from(name),
@@ -212,11 +239,9 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App, rows: &[ProcRow], state: &mu
     let table = Table::new(body, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::Rgb(40, 44, 52))
-                .add_modifier(Modifier::BOLD),
-        )
+        // Reverse video rather than a fixed RGB bar: truecolor isn't universal
+        // (Terminal.app has none) and a dark bar is wrong on a light theme.
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
 
     // Reuse the caller's persistent state so the scroll offset carries across
@@ -233,7 +258,7 @@ fn draw_detail(
     f: &mut Frame,
     area: Rect,
     app: &App,
-    flows: &[Flow],
+    flows: &[&Flow],
     services: &Services,
     resolver: Option<&Resolver>,
 ) {
@@ -269,14 +294,24 @@ fn draw_detail(
             } else {
                 "—".to_string()
             };
-            let remote = match fl.remote {
-                Some(ep) => {
+            let remote = match (fl.remote, fl.local) {
+                (Some(ep), _) => {
                     let host = resolver
                         .and_then(|r| r.lookup(ep.ip))
                         .unwrap_or_else(|| ep.ip.to_string());
                     format!("{host}:{}", services.label(ep.port, fl.proto))
                 }
-                None => "—".to_string(),
+                // No peer — a LISTEN socket or unconnected UDP — so the local
+                // endpoint is what identifies the flow.
+                (None, Some(ep)) => {
+                    let host = if ep.ip.is_unspecified() {
+                        "*".to_string()
+                    } else {
+                        ep.ip.to_string()
+                    };
+                    format!("{host}:{} (local)", services.label(ep.port, fl.proto))
+                }
+                (None, None) => "—".to_string(),
             };
             Row::new(vec![
                 Cell::from(fl.proto.as_str()),
@@ -326,9 +361,25 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let area = centered(60, 60, f.area());
+    let lines = help_lines();
+    // Sized to the text (plus the border), clamped to the terminal — a
+    // percentage box cuts the bottom of the key list off on a default 80×24.
+    let width = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4);
+    let height = lines.len() as u16 + 2;
+    let area = centered(width, height, f.area());
     f.render_widget(Clear, area);
-    let lines = vec![
+    let p = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title(" help "));
+    f.render_widget(p, area);
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    vec![
         Line::from(Span::styled(
             "netpeek — keys",
             Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
@@ -347,16 +398,14 @@ fn draw_help(f: &mut Frame) {
         Line::from("  i                 sort by pid"),
         Line::from("                    (press a sort key again to reverse)"),
         Line::from("  ? / h             toggle this help"),
+        Line::from("  esc               back out: help → filter → quit"),
         Line::from("  q / Ctrl-C        quit"),
         Line::from(""),
         Line::from(Span::styled(
             "  data: com.apple.network.statistics (same as nettop)",
             Style::default().fg(C_DIM),
         )),
-    ];
-    let p = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title(" help "));
-    f.render_widget(p, area);
+    ]
 }
 
 // ---- small cell helpers -----------------------------------------------------
@@ -374,21 +423,14 @@ fn rate_cell(rate: f64, color: Color) -> Line<'static> {
     Line::from(Span::styled(format::rate(rate), style)).alignment(Alignment::Right)
 }
 
-fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - pct_y) / 2),
-            Constraint::Percentage(pct_y),
-            Constraint::Percentage((100 - pct_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - pct_x) / 2),
-            Constraint::Percentage(pct_x),
-            Constraint::Percentage((100 - pct_x) / 2),
-        ])
-        .split(v[1])[1]
+/// A `width`×`height` rect centred in `area`, shrunk to fit if it's larger.
+fn centered(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }

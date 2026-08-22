@@ -10,6 +10,9 @@ use crate::model::SortKey;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cmd {
     Quit,
+    /// Back out one level: close the help, else clear an applied filter, else
+    /// quit — so a stray Esc doesn't drop the user out of the app.
+    Escape,
     Up,
     Down,
     PageUp,
@@ -49,6 +52,10 @@ pub struct App {
     pub should_quit: bool,
     /// Rows shown per page jump — set from the viewport each frame.
     pub page: usize,
+    /// Pid under the cursor. Re-found after every rebuild so the selection
+    /// follows the *process*, not the row index — a live sort reorders the rows
+    /// every tick, and an index-bound highlight would hop between processes.
+    pub anchor: Option<u32>,
 }
 
 impl Default for App {
@@ -64,6 +71,7 @@ impl Default for App {
             show_help: false,
             should_quit: false,
             page: 10,
+            anchor: None,
         }
     }
 }
@@ -94,10 +102,25 @@ impl App {
         }
     }
 
-    /// Handle one command. `len` is the number of currently-visible rows and
-    /// `selected_pid` the pid under the cursor (for expand), both supplied by the
-    /// render loop from the freshly filtered+sorted list.
-    pub fn handle(&mut self, cmd: Cmd, len: usize, selected_pid: Option<u32>) {
+    /// Re-aim the cursor after the visible rows were rebuilt: if the anchored
+    /// pid is still shown, follow it to its new index; otherwise keep the index,
+    /// clamped. Then re-anchor to whatever is now under the cursor. `pids` is
+    /// the freshly filtered+sorted list, top to bottom.
+    pub fn sync_selection(&mut self, pids: &[u32]) {
+        if let Some(p) = self.anchor
+            && let Some(i) = pids.iter().position(|&x| x == p)
+        {
+            self.selected = i;
+        }
+        self.clamp_selection(pids.len());
+        self.anchor = pids.get(self.selected).copied();
+    }
+
+    /// Handle one command against `pids`, the pids of the currently-visible rows
+    /// in display order (the render loop supplies it from the last frame). The
+    /// cursor is re-anchored to the row it lands on.
+    pub fn handle(&mut self, cmd: Cmd, pids: &[u32]) {
+        let len = pids.len();
         // While typing a filter, most keys edit the query.
         if self.mode == Mode::Filter {
             match cmd {
@@ -106,14 +129,14 @@ impl App {
                     self.filter.pop();
                 }
                 Cmd::FilterAccept => self.mode = Mode::Normal,
-                Cmd::FilterCancel => {
+                Cmd::FilterCancel | Cmd::Escape => {
                     self.filter.clear();
                     self.mode = Mode::Normal;
                 }
                 Cmd::Quit => self.mode = Mode::Normal,
                 _ => {}
             }
-            self.clamp_selection(len);
+            self.sync_selection(pids);
             return;
         }
 
@@ -121,6 +144,15 @@ impl App {
             Cmd::Quit => {
                 if self.show_help {
                     self.show_help = false;
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            Cmd::Escape => {
+                if self.show_help {
+                    self.show_help = false;
+                } else if !self.filter.is_empty() {
+                    self.filter.clear();
                 } else {
                     self.should_quit = true;
                 }
@@ -141,6 +173,7 @@ impl App {
             Cmd::End => self.selected = len.saturating_sub(1),
             Cmd::Sort(k) => self.apply_sort(k),
             Cmd::ToggleExpand => {
+                let selected_pid = pids.get(self.selected).copied();
                 self.expanded = match (self.expanded, selected_pid) {
                     (Some(p), Some(s)) if p == s => None, // collapse same row
                     (_, sel) => sel,                      // expand current (or none)
@@ -152,7 +185,10 @@ impl App {
             // filter-edit commands are inert in normal mode
             Cmd::FilterChar(_) | Cmd::FilterBackspace | Cmd::FilterAccept | Cmd::FilterCancel => {}
         }
+        // Navigation moved the index: anchor to the row it now sits on (the
+        // list itself hasn't changed, so there's no pid to follow yet).
         self.clamp_selection(len);
+        self.anchor = pids.get(self.selected).copied();
     }
 }
 
@@ -160,20 +196,25 @@ impl App {
 mod tests {
     use super::*;
 
+    /// `n` visible rows with pids 0..n.
+    fn pids(n: u32) -> Vec<u32> {
+        (0..n).collect()
+    }
+
     #[test]
     fn navigation_clamps() {
         let mut a = App::default();
-        a.handle(Cmd::Down, 3, None);
+        a.handle(Cmd::Down, &pids(3));
         assert_eq!(a.selected, 1);
-        a.handle(Cmd::Up, 3, None);
+        a.handle(Cmd::Up, &pids(3));
         assert_eq!(a.selected, 0);
-        a.handle(Cmd::Up, 3, None); // already at top
+        a.handle(Cmd::Up, &pids(3)); // already at top
         assert_eq!(a.selected, 0);
-        a.handle(Cmd::End, 3, None);
+        a.handle(Cmd::End, &pids(3));
         assert_eq!(a.selected, 2);
-        a.handle(Cmd::Down, 3, None); // at bottom
+        a.handle(Cmd::Down, &pids(3)); // at bottom
         assert_eq!(a.selected, 2);
-        a.handle(Cmd::Home, 3, None);
+        a.handle(Cmd::Home, &pids(3));
         assert_eq!(a.selected, 0);
     }
 
@@ -183,25 +224,25 @@ mod tests {
             page: 5,
             ..App::default()
         };
-        a.handle(Cmd::PageDown, 20, None);
+        a.handle(Cmd::PageDown, &pids(20));
         assert_eq!(a.selected, 5);
-        a.handle(Cmd::PageDown, 20, None);
+        a.handle(Cmd::PageDown, &pids(20));
         assert_eq!(a.selected, 10);
-        a.handle(Cmd::PageUp, 20, None);
+        a.handle(Cmd::PageUp, &pids(20));
         assert_eq!(a.selected, 5);
         // empty list keeps selection at 0
-        a.handle(Cmd::Down, 0, None);
-        a.handle(Cmd::PageDown, 0, None);
-        a.handle(Cmd::End, 0, None);
+        a.handle(Cmd::Down, &pids(0));
+        a.handle(Cmd::PageDown, &pids(0));
+        a.handle(Cmd::End, &pids(0));
         assert_eq!(a.selected, 0);
     }
 
     #[test]
     fn selection_clamps_when_list_shrinks() {
         let mut a = App::default();
-        a.handle(Cmd::End, 10, None);
+        a.handle(Cmd::End, &pids(10));
         assert_eq!(a.selected, 9);
-        a.handle(Cmd::Up, 3, None); // list shrank to 3
+        a.handle(Cmd::Up, &pids(3)); // list shrank to 3
         assert!(a.selected < 3);
     }
 
@@ -210,71 +251,71 @@ mod tests {
         let mut a = App::default();
         assert_eq!(a.sort, SortKey::Rate);
         assert!(a.sort_desc);
-        a.handle(Cmd::Sort(SortKey::Rate), 0, None); // same key flips
+        a.handle(Cmd::Sort(SortKey::Rate), &pids(0)); // same key flips
         assert!(!a.sort_desc);
-        a.handle(Cmd::Sort(SortKey::Name), 0, None); // new key: ascending default
+        a.handle(Cmd::Sort(SortKey::Name), &pids(0)); // new key: ascending default
         assert_eq!(a.sort, SortKey::Name);
         assert!(!a.sort_desc);
-        a.handle(Cmd::Sort(SortKey::Total), 0, None); // numeric: descending default
+        a.handle(Cmd::Sort(SortKey::Total), &pids(0)); // numeric: descending default
         assert!(a.sort_desc);
     }
 
     #[test]
     fn expand_toggles_on_selected_pid() {
         let mut a = App::default();
-        a.handle(Cmd::ToggleExpand, 3, Some(42));
+        a.handle(Cmd::ToggleExpand, &[42, 1, 2]);
         assert_eq!(a.expanded, Some(42));
-        a.handle(Cmd::ToggleExpand, 3, Some(42)); // same → collapse
+        a.handle(Cmd::ToggleExpand, &[42, 1, 2]); // same → collapse
         assert_eq!(a.expanded, None);
-        a.handle(Cmd::ToggleExpand, 3, Some(7));
+        a.handle(Cmd::ToggleExpand, &[7, 1, 2]);
         assert_eq!(a.expanded, Some(7));
-        a.handle(Cmd::ToggleExpand, 3, Some(8)); // different → switch
+        a.handle(Cmd::ToggleExpand, &[8, 1, 2]); // different → switch
         assert_eq!(a.expanded, Some(8));
     }
 
     #[test]
     fn pause_and_help_toggle() {
         let mut a = App::default();
-        a.handle(Cmd::Pause, 0, None);
+        a.handle(Cmd::Pause, &pids(0));
         assert!(a.paused);
-        a.handle(Cmd::Pause, 0, None);
+        a.handle(Cmd::Pause, &pids(0));
         assert!(!a.paused);
-        a.handle(Cmd::Help, 0, None);
+        a.handle(Cmd::Help, &pids(0));
         assert!(a.show_help);
         // q closes help rather than quitting
-        a.handle(Cmd::Quit, 0, None);
+        a.handle(Cmd::Quit, &pids(0));
         assert!(!a.show_help);
         assert!(!a.should_quit);
         // q again quits
-        a.handle(Cmd::Quit, 0, None);
+        a.handle(Cmd::Quit, &pids(0));
         assert!(a.should_quit);
     }
 
     #[test]
     fn filter_mode_editing() {
         let mut a = App::default();
-        a.handle(Cmd::FilterStart, 5, None);
+        a.handle(Cmd::FilterStart, &pids(5));
         assert_eq!(a.mode, Mode::Filter);
-        a.handle(Cmd::FilterChar('f'), 5, None);
-        a.handle(Cmd::FilterChar('o'), 5, None);
-        a.handle(Cmd::FilterChar('x'), 5, None);
+        a.handle(Cmd::FilterChar('f'), &pids(5));
+        a.handle(Cmd::FilterChar('o'), &pids(5));
+        a.handle(Cmd::FilterChar('x'), &pids(5));
         assert_eq!(a.filter, "fox");
-        a.handle(Cmd::FilterBackspace, 5, None);
+        a.handle(Cmd::FilterBackspace, &pids(5));
         assert_eq!(a.filter, "fo");
-        a.handle(Cmd::FilterAccept, 5, None);
+        a.handle(Cmd::FilterAccept, &pids(5));
         assert_eq!(a.mode, Mode::Normal);
         assert_eq!(a.filter, "fo"); // kept
-                                    // navigation commands don't edit the (now normal-mode) filter
-        a.handle(Cmd::Down, 5, None);
+        // navigation commands don't edit the (now normal-mode) filter
+        a.handle(Cmd::Down, &pids(5));
         assert_eq!(a.filter, "fo");
     }
 
     #[test]
     fn filter_cancel_clears() {
         let mut a = App::default();
-        a.handle(Cmd::FilterStart, 5, None);
-        a.handle(Cmd::FilterChar('z'), 5, None);
-        a.handle(Cmd::FilterCancel, 5, None);
+        a.handle(Cmd::FilterStart, &pids(5));
+        a.handle(Cmd::FilterChar('z'), &pids(5));
+        a.handle(Cmd::FilterCancel, &pids(5));
         assert_eq!(a.mode, Mode::Normal);
         assert!(a.filter.is_empty());
     }
@@ -282,8 +323,8 @@ mod tests {
     #[test]
     fn quit_in_filter_mode_just_exits_filter() {
         let mut a = App::default();
-        a.handle(Cmd::FilterStart, 5, None);
-        a.handle(Cmd::Quit, 5, None);
+        a.handle(Cmd::FilterStart, &pids(5));
+        a.handle(Cmd::Quit, &pids(5));
         assert_eq!(a.mode, Mode::Normal);
         assert!(!a.should_quit);
     }
@@ -291,23 +332,68 @@ mod tests {
     #[test]
     fn filter_mode_ignores_navigation_commands() {
         let mut a = App::default();
-        a.handle(Cmd::FilterStart, 5, None);
-        a.handle(Cmd::FilterChar('a'), 5, None);
+        a.handle(Cmd::FilterStart, &pids(5));
+        a.handle(Cmd::FilterChar('a'), &pids(5));
         // a navigation command in filter mode is a no-op (doesn't move/quit)
-        a.handle(Cmd::Down, 5, None);
-        a.handle(Cmd::Sort(SortKey::Name), 5, None);
+        a.handle(Cmd::Down, &pids(5));
+        a.handle(Cmd::Sort(SortKey::Name), &pids(5));
         assert_eq!(a.mode, Mode::Filter);
         assert_eq!(a.selected, 0);
         assert_eq!(a.filter, "a");
     }
 
     #[test]
+    fn selection_follows_the_anchored_pid_across_a_resort() {
+        let mut a = App::default();
+        a.handle(Cmd::Down, &[10, 20, 30]); // cursor on pid 20
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.anchor, Some(20));
+        // the live sort moved pid 20 to the top
+        a.sync_selection(&[20, 30, 10]);
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.anchor, Some(20));
+        // the anchored pid vanished: keep the (clamped) index, re-anchor
+        a.sync_selection(&[30]);
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.anchor, Some(30));
+        a.sync_selection(&[]);
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.anchor, None);
+    }
+
+    #[test]
+    fn escape_backs_out_one_level_at_a_time() {
+        let mut a = App::default();
+        a.handle(Cmd::FilterStart, &pids(5));
+        a.handle(Cmd::FilterChar('x'), &pids(5));
+        a.handle(Cmd::FilterAccept, &pids(5));
+        a.handle(Cmd::Help, &pids(5));
+        assert!(a.show_help);
+        a.handle(Cmd::Escape, &pids(5)); // 1: closes help
+        assert!(!a.show_help);
+        assert_eq!(a.filter, "x");
+        a.handle(Cmd::Escape, &pids(5)); // 2: clears the applied filter
+        assert!(a.filter.is_empty());
+        assert!(!a.should_quit);
+        a.handle(Cmd::Escape, &pids(5)); // 3: nothing left to back out of
+        assert!(a.should_quit);
+        // while typing, Esc cancels the filter like FilterCancel
+        let mut a = App::default();
+        a.handle(Cmd::FilterStart, &pids(5));
+        a.handle(Cmd::FilterChar('z'), &pids(5));
+        a.handle(Cmd::Escape, &pids(5));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.filter.is_empty());
+        assert!(!a.should_quit);
+    }
+
+    #[test]
     fn normal_mode_ignores_filter_edit_commands() {
         let mut a = App::default();
-        a.handle(Cmd::FilterChar('x'), 5, None);
-        a.handle(Cmd::FilterBackspace, 5, None);
-        a.handle(Cmd::FilterAccept, 5, None);
-        a.handle(Cmd::FilterCancel, 5, None);
+        a.handle(Cmd::FilterChar('x'), &pids(5));
+        a.handle(Cmd::FilterBackspace, &pids(5));
+        a.handle(Cmd::FilterAccept, &pids(5));
+        a.handle(Cmd::FilterCancel, &pids(5));
         assert!(a.filter.is_empty());
         assert_eq!(a.mode, Mode::Normal);
     }

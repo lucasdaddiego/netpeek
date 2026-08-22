@@ -23,26 +23,27 @@ A single self-contained Rust binary. No Homebrew formulae at runtime, no Python,
 no helper processes.
 
 ```
- netpeek   142 procs  613 flows   sort rate↓   every 1s   [your flows]   upd 19:44
+ netpeek   142 procs  613 flows  ↓ 4.7 MB/s ↑ 909 KB/s   sort rate↓   every 1s   [your flows]   upd 19:44
 ┌ processes ─────────────────────────────────────────────────────────────────────┐
 │   PID  PROCESS              DOWN     ↓        UP     ↑       TOTAL  CONNS         │
-│ ▾ 5821  Google Chrome H  4.6 MB/s ▂▃▅█  812 KB/s ▁▂▃▅   1.9 GB     38            │
-│   698  WiFiAgent          120 KB/s ▁▁▂▂   88 KB/s ▁▁▂▂   44 MB      6            │
-│   311  trustd             2.1 KB/s ▁▁▁▂    9 KB/s ▁▂▁▁   3.1 MB     3            │
-│   596  mDNSResponder         0 B/s ▁▁▁▁    0 B/s ▁▁▁▁    299 MB     2            │
-│   1   launchd               0 B/s ▁▁▁▁    0 B/s ▁▁▁▁     0 B        5            │
+│  5821  ▾ Google Chrome H  4.6 MB/s ▂▃▅█  812 KB/s ▁▂▃▅   1.9 GB     38            │
+│   698    WiFiAgent        120 KB/s ▁▁▂▂   88 KB/s ▁▁▂▂   44 MB      6            │
+│   311    trustd           2.1 KB/s ▁▁▁▂    9 KB/s ▁▂▁▁   3.1 MB     3            │
+│   596    mDNSResponder       0 B/s ▁▁▁▁    0 B/s ▁▁▁▁    299 MB     2            │
+│     1    launchd             0 B/s ▁▁▁▁    0 B/s ▁▁▁▁     0 B        5            │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌ Google Chrome Helper (pid 5821) — 38 flows ──────────────────────────────────────┐
 │ PROTO  STATE         REMOTE                          DOWN        UP               │
 │ TCP    ESTABLISHED   lhr25s34.1e100.net:443 (https)  4.1 MB/s   720 KB/s          │
 │ TCP    ESTABLISHED   server-18-66.r.cloudfront:443   480 KB/s    64 KB/s          │
 │ UDP    —             dns.google:443 (https)           18 KB/s    22 KB/s          │
+│ TCP    LISTEN        *:8080 (http-alt) (local)           0 B/s      0 B/s          │
 └──────────────────────────────────────────────────────────────────────────────┘
  q quit  ↑↓ move  enter expand  / filter  p pause  r/t/n/c/i sort  ? help
 ```
 
-<!-- asciinema demo: replace ID after recording with `asciinema rec` -->
-[![asciinema demo](https://asciinema.org/a/REPLACE_ME.svg)](https://asciinema.org/a/REPLACE_ME)
+<!-- asciinema demo: record with `asciinema rec`, then add
+[![asciinema demo](https://asciinema.org/a/ID.svg)](https://asciinema.org/a/ID) -->
 
 ## Contents
 
@@ -95,8 +96,8 @@ sortable, expandable TUI — unprivileged, in one binary.
 
 - **macOS** (built & tested on **macOS 26 / Apple Silicon**; targets macOS 13+ —
   see [limitations](#accuracy--honest-limitations) for why 13 is the floor).
-- A **Rust toolchain** to build (`brew install rust`, or rustup). That's it —
-  no crates fetched at runtime, no system libraries beyond what macOS ships.
+- A **Rust toolchain** (1.88+) to build (`brew install rust`, or rustup). That's
+  it — no crates fetched at runtime, no system libraries beyond what macOS ships.
 
 ## Install
 
@@ -128,7 +129,7 @@ netpeek --help            # usage summary
 
 | Flag | Description |
 |------|-------------|
-| `--once` | Single text-table snapshot (two samples for a real rate), then exit. |
+| `--once` | Single text-table snapshot (waits until every flow is named, then two samples for a real rate), then exit. |
 | `--json` | Single snapshot as a JSON array, sorted by rate, keys alphabetised. |
 | `--diag` | Print socket connectivity, privilege, flow/process counts and top talkers. |
 | `--interval SECS` | Refresh and rate-sampling interval (default `1.0`, `0.2`–`3600`). |
@@ -150,6 +151,10 @@ Everything else is a **live** control — see the keys below.
 | <kbd>enter</kbd>/<kbd>space</kbd> | expand a process to its flows | | <kbd>i</kbd> | sort by p**i**d |
 | <kbd>/</kbd> | filter by name or pid | | | (repeat a sort key to reverse) |
 | <kbd>p</kbd> | pause / freeze | | <kbd>?</kbd> | help |
+| <kbd>esc</kbd> | back out: close help → clear filter → quit | | | |
+
+The selection follows the **process**, not the row: when a live sort reorders
+the table, the highlight stays on the pid you picked.
 
 Run with `--mouse` and the mouse wheel scrolls the list too — it's off by
 default so the terminal's own text selection / copy keeps working.
@@ -158,7 +163,7 @@ default so the terminal's own text selection / copy keeps working.
 
 | Column | Meaning |
 |--------|---------|
-| **PID** | Process id. `▸`/`▾` marks whether its flows are expanded. |
+| **PID** | Process id. `▾` marks the process whose flows are expanded. |
 | **PROCESS** | Process name from the kernel; falls back to the executable name for unnamed flows. |
 | **DOWN** / **UP** | Receive / transmit **rate** (bytes/sec), derived from the change in the kernel's cumulative counters over the interval. Dimmed when idle. |
 | **↓** / **↑** | Sparkline of recent down / up rates (last ~60 samples), scaled to that process's own peak. |
@@ -168,7 +173,8 @@ default so the terminal's own text selection / copy keeps working.
 In the expanded **detail pane**, each flow shows protocol, TCP state, the remote
 `host:port (service)` and its own down/up rate. Remote hosts are reverse-DNS'd
 in the background; until a name resolves (or if it has no PTR record) the raw IP
-is shown.
+is shown. A flow with no peer — a `LISTEN` socket, an unconnected UDP socket —
+shows its local endpoint instead, tagged `(local)`.
 
 ## JSON / scripting output
 

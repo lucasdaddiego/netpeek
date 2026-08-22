@@ -14,7 +14,7 @@ use ratatui::widgets::TableState;
 
 use netpeek::app::{App, Cmd, Mode};
 use netpeek::dns::Resolver;
-use netpeek::model::{matches_filter, sort_rows, ProcRow, SortKey};
+use netpeek::model::{Filter, ProcRow, SortKey, sort_rows};
 use netpeek::ntstat::Monitor;
 use netpeek::services::Services;
 use netpeek::{format, ui};
@@ -97,7 +97,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     _ => {
                         return Err(format!(
                             "--interval needs a number of seconds between {MIN_INTERVAL} and {MAX_INTERVAL}"
-                        ))
+                        ));
                     }
                 }
             }
@@ -124,15 +124,29 @@ fn load_services() -> Services {
     s
 }
 
+/// How long the one-shot modes will wait for every flow to be described before
+/// sampling anyway (a bound, not a delay — the settle ends as soon as the
+/// descriptor queue is empty).
+const SETTLE_MAX: Duration = Duration::from_secs(5);
+
 /// Run a handful of collection cycles on an already-open monitor so rates are
 /// populated. Shared by the one-shot (`--once`/`--json`/`--diag`) modes.
 fn collect_snapshot(mon: &mut Monitor, opts: &Opts) -> io::Result<()> {
     let dt = opts.interval;
     let sleep = Duration::from_secs_f64(dt);
-    // Settle: descriptor requests are paced, so drain repeatedly to let every
-    // SRC_ADDED be seen and named before we sample.
-    for _ in 0..12 {
+    // Settle: descriptor requests are paced (a batch per drain), so keep
+    // draining until none are queued — a fixed number of drains would name only
+    // the first few batches' worth of flows on a busy machine and silently drop
+    // the rest from the snapshot. A few extra drains let the last replies land.
+    let settle_start = Instant::now();
+    let mut idle_drains = 0;
+    while idle_drains < 4 && settle_start.elapsed() < SETTLE_MAX {
         mon.drain()?;
+        idle_drains = if mon.pending_desc() == 0 {
+            idle_drains + 1
+        } else {
+            0
+        };
         std::thread::sleep(Duration::from_millis(60));
     }
     // Two count samples spaced by the interval gives a real rate.
@@ -274,13 +288,8 @@ fn json_escape(s: &str) -> String {
 fn run_tui(opts: &Opts) -> io::Result<()> {
     let mut mon = Monitor::new(HIST_LEN)?;
     let services = load_services();
-    let resolver = if opts.resolve {
-        Some(Resolver::new())
-    } else {
-        None
-    };
+    let resolver = opts.resolve.then(Resolver::new);
     let mut app = App::default();
-    let interval = Duration::from_secs_f64(opts.interval);
 
     let mut terminal = ratatui::init();
 
@@ -295,13 +304,6 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
         if opts.mouse {
             execute!(io::stdout(), EnableMouseCapture)?;
         }
-
-        // Prime the pump: collect initial sources and request the first counts.
-        mon.drain()?;
-        mon.poll_counts()?;
-        let mut last_tick = Instant::now();
-        let mut last_update = clock_hms();
-
         run_loop(
             &mut terminal,
             &mut mon,
@@ -309,9 +311,6 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
             resolver.as_ref(),
             &mut app,
             opts,
-            interval,
-            &mut last_tick,
-            &mut last_update,
         )
     })();
 
@@ -322,7 +321,6 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
     res
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     mon: &mut Monitor,
@@ -330,19 +328,24 @@ fn run_loop(
     resolver: Option<&Resolver>,
     app: &mut App,
     opts: &Opts,
-    interval: Duration,
-    last_tick: &mut Instant,
-    last_update: &mut String,
 ) -> io::Result<()> {
+    let interval = Duration::from_secs_f64(opts.interval);
+    let elevated = elevated();
+
+    // Prime the pump: collect initial sources and request the first counts.
+    mon.drain()?;
+    mon.poll_counts()?;
+    let mut last_tick = Instant::now();
+    let mut last_update = clock_hms();
+
     // Persisted across frames so the table's scroll offset survives (a fresh
     // state each frame would reset it and pin the selection to the bottom).
     let mut table_state = TableState::default();
     let mut needs_redraw = true;
-    // Row count + cursor pid from the last rendered frame. Input is interpreted
-    // against what's on screen, so idle loops (no tick, no key) can skip the
-    // rebuild+redraw entirely instead of busy-redrawing ~8×/sec.
-    let mut shown_len = 0usize;
-    let mut shown_pid: Option<u32> = None;
+    // Pids of the rows on screen, top to bottom, from the last rendered frame.
+    // Input is interpreted against what's on screen, so idle loops (no tick, no
+    // key) can skip the rebuild+redraw entirely instead of busy-redrawing ~8×/sec.
+    let mut shown_pids: Vec<u32> = Vec::new();
     // Pause freezes sampling, so on resume we re-prime rather than measure a
     // delta that spans the whole pause (which would render as a rate spike).
     let mut was_paused = false;
@@ -359,82 +362,87 @@ fn run_loop(
             // paused interval isn't divided into a single tick as a spike.
             mon.poll_counts()?;
             mon.reprime();
-            *last_tick = now;
+            last_tick = now;
         }
         was_paused = app.paused;
 
-        if !app.paused && now.duration_since(*last_tick) >= interval {
-            let dt = now.duration_since(*last_tick).as_secs_f64();
+        if !app.paused && now.duration_since(last_tick) >= interval {
+            let dt = now.duration_since(last_tick).as_secs_f64();
             mon.tick(dt);
             mon.poll_counts()?;
-            *last_tick = now;
-            *last_update = clock_hms();
+            last_tick = now;
+            last_update = clock_hms();
             needs_redraw = true; // fresh counters
         }
 
         if needs_redraw {
-            // Build the visible (filtered + sorted) row set.
-            let mut rows: Vec<ProcRow> = mon
-                .engine()
-                .rows()
-                .iter()
-                .filter(|r| matches_filter(r, &app.filter))
-                .cloned()
-                .collect();
+            // Build the visible (filtered + sorted) row set — borrowed, so a
+            // redraw doesn't clone every row and its sparkline history.
+            let all = mon.engine().rows();
+            let filter = Filter::new(&app.filter);
+            let mut rows: Vec<&ProcRow> = all.iter().filter(|r| filter.matches(r)).collect();
             sort_rows(&mut rows, app.sort, app.sort_desc);
-            app.clamp_selection(rows.len());
 
-            shown_len = rows.len();
-            shown_pid = rows.get(app.selected).map(|r| r.pid);
+            shown_pids.clear();
+            shown_pids.extend(rows.iter().map(|r| r.pid));
+            // Follow the process under the cursor to wherever the sort put it.
+            app.sync_selection(&shown_pids);
+
             let flows = app
                 .expanded
                 .map(|pid| mon.engine().flows_for(pid))
                 .unwrap_or_default();
+            let (rx_rate, tx_rate) = all
+                .iter()
+                .fold((0.0, 0.0), |(rx, tx), r| (rx + r.rx_rate, tx + r.tx_rate));
 
-            let status = ui::StatusInfo {
-                proc_count: rows.len(),
-                flow_count: mon.engine().flow_count(),
-                interval_secs: opts.interval,
-                last_update: last_update.clone(),
-                elevated: elevated(),
+            let view = ui::View {
+                rows: &rows,
+                flows: &flows,
+                services,
+                resolver,
+                status: ui::StatusInfo {
+                    shown_procs: rows.len(),
+                    total_procs: all.len(),
+                    flow_count: mon.engine().flow_count(),
+                    rx_rate,
+                    tx_rate,
+                    interval_secs: opts.interval,
+                    last_update: &last_update,
+                    elevated,
+                },
             };
 
             terminal.draw(|f| {
                 app.page = (f.area().height as usize).saturating_sub(6).max(1);
-                ui::draw(
-                    f,
-                    app,
-                    &rows,
-                    &flows,
-                    services,
-                    resolver,
-                    &status,
-                    &mut table_state,
-                );
+                ui::draw(f, app, &view, &mut table_state);
             })?;
             needs_redraw = false;
         }
 
         // Wait briefly for input. A key / mouse / resize asks for a redraw on the
-        // next loop; with none we stay idle (just draining the socket).
+        // next loop; with none we stay idle (just draining the socket). Whatever
+        // else is already queued (a held key arrives as a burst) is applied in
+        // the same pass, so it costs one rebuild+redraw rather than one each.
         if event::poll(Duration::from_millis(120))? {
-            match event::read()? {
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    if let Some(cmd) = key_to_cmd(k.code, k.modifiers, app.mode) {
-                        app.handle(cmd, shown_len, shown_pid);
+            loop {
+                match event::read()? {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => {
+                        if let Some(cmd) = key_to_cmd(k.code, k.modifiers, app.mode) {
+                            app.handle(cmd, &shown_pids);
+                        }
                     }
-                    needs_redraw = true;
-                }
-                Event::Mouse(m) => {
-                    match m.kind {
-                        MouseEventKind::ScrollDown => app.handle(Cmd::Down, shown_len, shown_pid),
-                        MouseEventKind::ScrollUp => app.handle(Cmd::Up, shown_len, shown_pid),
+                    Event::Mouse(m) => match m.kind {
+                        MouseEventKind::ScrollDown => app.handle(Cmd::Down, &shown_pids),
+                        MouseEventKind::ScrollUp => app.handle(Cmd::Up, &shown_pids),
                         _ => {}
-                    }
-                    needs_redraw = true;
+                    },
+                    _ => {}
                 }
-                Event::Resize(_, _) => needs_redraw = true,
-                _ => {}
+                needs_redraw = true;
+                if app.should_quit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
 
@@ -462,7 +470,8 @@ fn key_to_cmd(code: KeyCode, mods: KeyModifiers, mode: Mode) -> Option<Cmd> {
         };
     }
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => Some(Cmd::Quit),
+        KeyCode::Char('q') => Some(Cmd::Quit),
+        KeyCode::Esc => Some(Cmd::Escape),
         KeyCode::Up | KeyCode::Char('k') => Some(Cmd::Up),
         KeyCode::Down | KeyCode::Char('j') => Some(Cmd::Down),
         KeyCode::PageUp => Some(Cmd::PageUp),
@@ -518,7 +527,8 @@ OPTIONS:
 
 TUI KEYS:
     ↑/↓ k/j move   PgUp/PgDn page   g/G top/bottom   enter expand a process
-    / filter   p pause   r/t/n/c/i sort (repeat to reverse)   ? help   q quit
+    / filter   p pause   r/t/n/c/i sort (repeat to reverse)   ? help
+    q quit   esc back out (help → filter → quit)
 "
     );
 }
@@ -604,6 +614,11 @@ mod tests {
         assert_eq!(
             key_to_cmd(KeyCode::Char('z'), KeyModifiers::NONE, Mode::Normal),
             None
+        );
+        // Esc is the stepwise back-out, not a hard quit
+        assert_eq!(
+            key_to_cmd(KeyCode::Esc, KeyModifiers::NONE, Mode::Normal),
+            Some(Cmd::Escape)
         );
     }
 
