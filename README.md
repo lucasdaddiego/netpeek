@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lucasdaddiego/netpeek/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasdaddiego/netpeek/actions/workflows/ci.yml)
 ![platform](https://img.shields.io/badge/platform-macOS%2013%2B-black?logo=apple)
-![language](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
+![language](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![dependencies](https://img.shields.io/badge/runtime%20deps-none-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 

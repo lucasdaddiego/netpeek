@@ -293,6 +293,18 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
 
     let mut terminal = ratatui::init();
 
+    // init() installs a panic hook that restores raw mode and the alternate
+    // screen, but it knows nothing about mouse capture: a panic under --mouse
+    // would leave the terminal reporting every wheel and click into the shell
+    // as escape garbage. Chain a hook that releases the mouse first.
+    if opts.mouse {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            hook(info);
+        }));
+    }
+
     // Everything after ratatui::init() runs inside this closure so that the
     // restore below is reached however it ends. init() turns on raw mode and the
     // alternate screen but installs only a *panic* hook — an early `?` out here
