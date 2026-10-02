@@ -474,6 +474,8 @@ fn key_to_cmd(code: KeyCode, mods: KeyModifiers, mode: Mode) -> Option<Cmd> {
     }
     if mode == Mode::Filter {
         return match code {
+            // A Ctrl chord is not text: Ctrl-U must not type a 'u'.
+            KeyCode::Char(_) if mods.contains(KeyModifiers::CONTROL) => None,
             KeyCode::Char(c) => Some(Cmd::FilterChar(c)),
             KeyCode::Backspace => Some(Cmd::FilterBackspace),
             KeyCode::Enter => Some(Cmd::FilterAccept),
@@ -665,5 +667,23 @@ mod tests {
             key_to_cmd(KeyCode::Char('c'), KeyModifiers::NONE, Mode::Filter),
             Some(Cmd::FilterChar('c'))
         );
+        // shifted letters still type
+        assert_eq!(
+            key_to_cmd(KeyCode::Char('X'), KeyModifiers::SHIFT, Mode::Filter),
+            Some(Cmd::FilterChar('X'))
+        );
+    }
+
+    #[test]
+    fn keymap_filter_mode_ignores_ctrl_letters() {
+        // Ctrl-U, Ctrl-W, Ctrl-A ... are not text: they must not type 'u', 'w',
+        // 'a' into the query.
+        for c in ['u', 'w', 'a', 'k'] {
+            assert_eq!(
+                key_to_cmd(KeyCode::Char(c), KeyModifiers::CONTROL, Mode::Filter),
+                None,
+                "Ctrl-{c} typed into the filter"
+            );
+        }
     }
 }
