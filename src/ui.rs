@@ -299,7 +299,7 @@ fn draw_detail(
                     let host = resolver
                         .and_then(|r| r.lookup(ep.ip))
                         .unwrap_or_else(|| ep.ip.to_string());
-                    format!("{host}:{}", services.label(ep.port, fl.proto))
+                    format::host_port(&host, &services.label(ep.port, fl.proto))
                 }
                 // No peer — a LISTEN socket or unconnected UDP — so the local
                 // endpoint is what identifies the flow.
@@ -309,7 +309,8 @@ fn draw_detail(
                     } else {
                         ep.ip.to_string()
                     };
-                    format!("{host}:{} (local)", services.label(ep.port, fl.proto))
+                    let local = format::host_port(&host, &services.label(ep.port, fl.proto));
+                    format!("{local} (local)")
                 }
                 (None, None) => "—".to_string(),
             };

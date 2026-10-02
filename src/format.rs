@@ -40,6 +40,17 @@ pub fn secs(seconds: f64) -> String {
     }
 }
 
+/// Join a host and a port label as `host:port`. An IPv6 literal goes in
+/// brackets (`[::1]:443`), or its own colons would swallow the port. Hostnames
+/// and IPv4 addresses never contain a colon, so a colon marks a v6 literal.
+pub fn host_port(host: &str, port: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// `nstat_tcp_descriptor.state` → the BSD TCP FSM name (`netinet/tcp_fsm.h`).
 pub fn tcp_state(state: u32) -> &'static str {
     match state {
@@ -120,6 +131,16 @@ mod tests {
         assert_eq!(secs(0.5), "0.5");
         // and a fractional interval isn't rounded to a different window
         assert_eq!(secs(1.5), "1.5");
+    }
+
+    #[test]
+    fn host_port_brackets_ipv6_literals() {
+        assert_eq!(host_port("1.1.1.1", "443 (https)"), "1.1.1.1:443 (https)");
+        assert_eq!(host_port("dns.google", "53"), "dns.google:53");
+        assert_eq!(host_port("*", "5353"), "*:5353");
+        // an IPv6 literal's own colons would swallow the port without brackets
+        assert_eq!(host_port("2606:4700::1111", "443"), "[2606:4700::1111]:443");
+        assert_eq!(host_port("::1", "8080"), "[::1]:8080");
     }
 
     #[test]
