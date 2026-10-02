@@ -47,6 +47,9 @@ pub struct Flow {
     pub tx_rate: f64,
     /// Set once a descriptor has named the flow (pid / addrs known).
     described: bool,
+    /// Set once the kernel has reported counts for the flow. Until then the
+    /// zero counters are a placeholder, not a baseline. See [`Engine::tick`].
+    counted: bool,
     /// False until a `tick` has captured a baseline counter for this flow. The
     /// kernel's counters are cumulative since the flow began, so the first delta
     /// — against zero at startup, or against a stale value after a pause — would
@@ -71,6 +74,7 @@ impl Flow {
             rx_rate: 0.0,
             tx_rate: 0.0,
             described: false,
+            counted: false,
             primed: false,
         }
     }
@@ -203,6 +207,7 @@ impl Engine {
         if let Some(f) = self.flows.get_mut(&srcref) {
             f.rx_bytes = counts.rx_bytes;
             f.tx_bytes = counts.tx_bytes;
+            f.counted = true;
         }
     }
 
@@ -236,9 +241,12 @@ impl Engine {
                 // First sample for this flow (or first after a resume): capture
                 // the baseline, don't emit a rate. The counter is cumulative
                 // since the flow began, so a delta against zero/stale would spike.
+                // A flow with no counts yet stays unprimed: baselining its zero
+                // placeholder would turn the first real counts (the whole
+                // lifetime total) into a one-tick spike.
                 f.rx_rate = 0.0;
                 f.tx_rate = 0.0;
-                f.primed = true;
+                f.primed = f.counted;
             } else if dt > 0.0 {
                 f.rx_rate = f.rx_bytes.saturating_sub(f.prev_rx) as f64 / dt;
                 f.tx_rate = f.tx_bytes.saturating_sub(f.prev_tx) as f64 / dt;
@@ -790,6 +798,39 @@ mod tests {
         e.tick(1.0);
         assert_eq!(e.rows()[0].rx_rate, 2_000.0);
         assert_eq!(e.rows()[0].tx_rate, 500.0);
+    }
+
+    #[test]
+    fn baseline_waits_for_the_first_counts() {
+        // A tick can land before the kernel has sent any counts for a flow (a
+        // dropped or late SRC_COUNTS reply for a connection that predates us).
+        // Priming then would baseline at zero, and the counts that arrive next
+        // carry the flow's whole lifetime total — one huge fake spike.
+        let mut e = Engine::new(8);
+        e.on_added(1, Proto::Tcp);
+        e.on_desc(1, Proto::Tcp, desc(100, "curl", 443));
+        e.tick(1.0); // no counts yet
+        assert_eq!(e.rows()[0].rx_rate, 0.0);
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 5_000_000,
+                tx_bytes: 1_000_000,
+            },
+        );
+        e.tick(1.0); // first counts: this is the baseline, not a delta
+        assert_eq!(e.rows()[0].rx_rate, 0.0);
+        assert_eq!(e.rows()[0].tx_rate, 0.0);
+        e.on_counts(
+            1,
+            Counts {
+                rx_bytes: 5_003_000,
+                tx_bytes: 1_000_100,
+            },
+        );
+        e.tick(1.0);
+        assert_eq!(e.rows()[0].rx_rate, 3_000.0);
+        assert_eq!(e.rows()[0].tx_rate, 100.0);
     }
 
     #[test]
