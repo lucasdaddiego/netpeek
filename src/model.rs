@@ -354,16 +354,18 @@ impl Engine {
         &self.rows
     }
 
-    /// All described flows belonging to `pid`, sorted by combined rate desc then
-    /// remote port — for the expanded detail view. Borrowed, not cloned: the
-    /// detail pane is rebuilt on every redraw.
+    /// All described flows belonging to `pid`, sorted by combined rate desc, then
+    /// remote port, then srcref — for the expanded detail view. The srcref makes
+    /// it a total order, so idle flows keep their places between redraws.
+    /// Borrowed, not cloned: the detail pane is rebuilt on every redraw.
     pub fn flows_for(&self, pid: u32) -> Vec<&Flow> {
-        let mut v: Vec<&Flow> = self
+        let mut v: Vec<(u64, &Flow)> = self
             .flows
-            .values()
-            .filter(|f| f.described && f.pid == pid)
+            .iter()
+            .filter(|(_, f)| f.described && f.pid == pid)
+            .map(|(&srcref, f)| (srcref, f))
             .collect();
-        v.sort_by(|a, b| {
+        v.sort_by(|(ar, a), (br, b)| {
             (b.rx_rate + b.tx_rate)
                 .total_cmp(&(a.rx_rate + a.tx_rate))
                 .then_with(|| {
@@ -371,8 +373,9 @@ impl Engine {
                     let bp = b.remote.map(|e| e.port).unwrap_or(0);
                     ap.cmp(&bp)
                 })
+                .then_with(|| ar.cmp(br))
         });
-        v
+        v.into_iter().map(|(_, f)| f).collect()
     }
 
     /// Total number of tracked flows (for the status line / `--diag`).
@@ -1049,5 +1052,27 @@ mod tests {
         // equal rate → lower remote port first
         assert_eq!(flows[0].remote.unwrap().port, 443);
         assert_eq!(flows[1].remote.unwrap().port, 8443);
+    }
+
+    #[test]
+    fn flows_for_is_a_total_order() {
+        // Idle flows with the same rate and the same remote port (or none)
+        // tied, so they came out in HashMap order, which differs per map: the
+        // expanded pane shuffled on every redraw. The srcref breaks the tie.
+        let mut e = Engine::new(8);
+        for srcref in (1..=20u64).rev() {
+            e.on_added(srcref, Proto::Tcp);
+            e.on_desc(srcref, Proto::Tcp, desc(50, "x", 443));
+            e.on_counts(
+                srcref,
+                Counts {
+                    rx_bytes: srcref * 100, // different totals, same zero rate
+                    tx_bytes: 0,
+                },
+            );
+        }
+        e.tick(1.0);
+        let order: Vec<u64> = e.flows_for(50).iter().map(|f| f.rx_bytes / 100).collect();
+        assert_eq!(order, (1..=20u64).collect::<Vec<_>>());
     }
 }

@@ -20,9 +20,14 @@ pub fn bytes(n: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    // one decimal below 10, none above — keeps the field narrow
-    if v < 10.0 {
+    // One decimal below 10, none from 10 up — keeps the field narrow. Decide on
+    // the value as it will round, not the raw one: 9.97 would print "10.0" and
+    // 1023.7 "1024". Below 9.95, `{:.1}` tops out at "9.9"; from 1023.5, `{:.0}`
+    // would print "1024", so move up a unit, where it prints "1.0".
+    if v < 9.95 {
         format!("{v:.1} {}", UNITS[u])
+    } else if v >= 1023.5 && u < UNITS.len() - 1 {
+        format!("{:.1} {}", v / 1024.0, UNITS[u + 1])
     } else {
         format!("{v:.0} {}", UNITS[u])
     }
@@ -111,6 +116,24 @@ mod tests {
         assert_eq!(bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
         // huge value saturates at the top unit rather than overflowing
         assert!(bytes(u64::MAX).ends_with(" PB"));
+    }
+
+    #[test]
+    fn bytes_unit_and_decimal_boundaries() {
+        // One rule, applied to the rounded value: one decimal below 10, none
+        // from 10, and the next unit up once the number would show as 1024.
+        // 9.95 KB and up used to print "10.0 KB"; 1023.5 KB and up "1024 KB".
+        assert_eq!(bytes(10_188), "9.9 KB"); // 9.949 KB
+        assert_eq!(bytes(10_189), "10 KB"); // 9.950 KB
+        assert_eq!(bytes(10_239), "10 KB");
+        assert_eq!(bytes(1_048_063), "1023 KB"); // 1023.499 KB
+        assert_eq!(bytes(1_048_064), "1.0 MB"); // 1023.5 KB
+        assert_eq!(bytes(1_048_575), "1.0 MB"); // 1 MB − 1 B
+        assert_eq!(bytes(1023 * 1024 * 1024 + 512 * 1024), "1.0 GB");
+        assert_eq!(bytes(9 * 1024 * 1024 + 1000 * 1024), "10 MB"); // 9.977 MB
+        // the top unit has nowhere to go, so it keeps counting
+        assert_eq!(bytes(2048 * 1024u64.pow(5)), "2048 PB");
+        assert_eq!(rate(1_048_064.0), "1.0 MB/s");
     }
 
     #[test]
