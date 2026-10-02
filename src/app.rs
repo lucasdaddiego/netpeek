@@ -133,7 +133,9 @@ impl App {
                     self.filter.clear();
                     self.mode = Mode::Normal;
                 }
-                Cmd::Quit => self.mode = Mode::Normal,
+                // Only Ctrl-C / Ctrl-D map to Quit here ('q' types a 'q'), and
+                // those quit from anywhere. Esc is how you leave the filter.
+                Cmd::Quit => self.should_quit = true,
                 _ => {}
             }
             self.sync_selection(pids);
@@ -321,12 +323,15 @@ mod tests {
     }
 
     #[test]
-    fn quit_in_filter_mode_just_exits_filter() {
+    fn quit_in_filter_mode_quits() {
+        // Cmd::Quit only reaches filter mode from Ctrl-C / Ctrl-D ('q' is a
+        // literal there), and those always quit — the help, README and keymap
+        // all say so. Esc is the key that just leaves the filter.
         let mut a = App::default();
         a.handle(Cmd::FilterStart, &pids(5));
+        a.handle(Cmd::FilterChar('z'), &pids(5));
         a.handle(Cmd::Quit, &pids(5));
-        assert_eq!(a.mode, Mode::Normal);
-        assert!(!a.should_quit);
+        assert!(a.should_quit);
     }
 
     #[test]
