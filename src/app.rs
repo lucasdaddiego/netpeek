@@ -77,19 +77,13 @@ impl Default for App {
 }
 
 impl App {
-    /// Default sort direction for a freshly-chosen column: descending for the
-    /// numeric "biggest first" columns, ascending for name/pid.
-    fn default_desc(key: SortKey) -> bool {
-        matches!(key, SortKey::Rate | SortKey::Total | SortKey::Conns)
-    }
-
     /// Choose a sort column, or flip direction if it's already selected.
     fn apply_sort(&mut self, key: SortKey) {
         if self.sort == key {
             self.sort_desc = !self.sort_desc;
         } else {
             self.sort = key;
-            self.sort_desc = Self::default_desc(key);
+            self.sort_desc = key.descending_by_default();
         }
     }
 

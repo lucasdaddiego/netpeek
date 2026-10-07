@@ -126,6 +126,26 @@ impl SortKey {
             SortKey::Pid => "pid",
         }
     }
+
+    /// The key named by `--sort` (the same words as [`SortKey::label`]).
+    pub fn parse(name: &str) -> Option<SortKey> {
+        [
+            SortKey::Rate,
+            SortKey::Total,
+            SortKey::Name,
+            SortKey::Conns,
+            SortKey::Pid,
+        ]
+        .into_iter()
+        .find(|k| k.label() == name)
+    }
+
+    /// Default direction for a freshly-chosen column: descending for the
+    /// numeric "biggest first" columns, ascending for name / pid. Shared by
+    /// the TUI's sort keys and `--sort`.
+    pub fn descending_by_default(self) -> bool {
+        matches!(self, SortKey::Rate | SortKey::Total | SortKey::Conns)
+    }
 }
 
 struct ProcHist {
@@ -466,6 +486,30 @@ mod tests {
             remote: Some(ep(1, 1, 1, 1, remote_port)),
             tcp_state: 4,
         }
+    }
+
+    #[test]
+    fn sort_key_parses_its_own_labels() {
+        for k in [
+            SortKey::Rate,
+            SortKey::Total,
+            SortKey::Name,
+            SortKey::Conns,
+            SortKey::Pid,
+        ] {
+            assert_eq!(SortKey::parse(k.label()), Some(k));
+        }
+        assert_eq!(SortKey::parse("RATE"), None);
+        assert_eq!(SortKey::parse(""), None);
+    }
+
+    #[test]
+    fn numeric_keys_default_to_descending() {
+        assert!(SortKey::Rate.descending_by_default());
+        assert!(SortKey::Total.descending_by_default());
+        assert!(SortKey::Conns.descending_by_default());
+        assert!(!SortKey::Name.descending_by_default());
+        assert!(!SortKey::Pid.descending_by_default());
     }
 
     #[test]

@@ -121,6 +121,7 @@ netpeek                   # interactive TUI (default)
 netpeek --once            # one snapshot as a text table, then exit
 netpeek --json            # one snapshot as a JSON array on stdout (pipe into jq)
 netpeek --diag            # connectivity + permission diagnostics
+netpeek --once --sort name  # one-shot row order: rate (default), total, name, conns, pid
 netpeek --interval 0.5    # faster refresh / sampling (default 1.0s, min 0.2)
 netpeek --no-resolve      # don't reverse-DNS remote hosts
 netpeek --mouse           # capture the mouse so the wheel scrolls the list
@@ -133,6 +134,7 @@ netpeek --help            # usage summary
 | `--json` | Single snapshot as a JSON array, sorted by rate, keys alphabetised. |
 | `--diag` | Print socket connectivity, privilege, flow/process counts and top talkers. |
 | `--interval SECS` | Refresh and rate-sampling interval (default `1.0`, `0.2`–`3600`). |
+| `--sort KEY` | Row order for `--once` / `--json`: `rate` (default), `total`, `name`, `conns` or `pid` — the TUI's <kbd>r</kbd>/<kbd>t</kbd>/<kbd>n</kbd>/<kbd>c</kbd>/<kbd>i</kbd>, in the same default directions. |
 | `--no-resolve` | Skip reverse DNS; the detail pane shows raw IPs. |
 | `--mouse` | Capture the mouse so the wheel scrolls the list. Off by default, so the terminal's own text selection / copy keeps working (the keys scroll regardless). |
 | `--version`, `-V` | Print version. |

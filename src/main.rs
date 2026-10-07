@@ -37,6 +37,9 @@ struct Opts {
     /// Capture the mouse for wheel-scroll. Off by default so the terminal's own
     /// text selection / copy keeps working (you can still scroll with the keys).
     mouse: bool,
+    /// Row order for the one-shot modes (`--sort`), in the key's default
+    /// direction — the same keys and directions the TUI's r/t/n/c/i use.
+    sort: SortKey,
 }
 
 fn main() {
@@ -98,6 +101,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         interval: DEFAULT_INTERVAL,
         resolve: true,
         mouse: false,
+        sort: SortKey::Rate,
     };
     let mut i = 0;
     while i < args.len() {
@@ -113,6 +117,13 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                             "--interval needs a number of seconds between {MIN_INTERVAL} and {MAX_INTERVAL}"
                         ));
                     }
+                }
+            }
+            "--sort" => {
+                i += 1;
+                match args.get(i).and_then(|s| SortKey::parse(s)) {
+                    Some(key) => opts.sort = key,
+                    None => return Err("--sort needs one of rate, total, name, conns, pid".into()),
                 }
             }
             "--no-resolve" => opts.resolve = false,
@@ -173,16 +184,16 @@ fn collect_snapshot(mon: &mut Monitor, opts: &Opts) -> io::Result<()> {
     Ok(())
 }
 
-fn sorted_rows(mon: &Monitor) -> Vec<ProcRow> {
+fn sorted_rows(mon: &Monitor, key: SortKey) -> Vec<ProcRow> {
     let mut rows: Vec<ProcRow> = mon.engine().rows().to_vec();
-    sort_rows(&mut rows, SortKey::Rate, true);
+    sort_rows(&mut rows, key, key.descending_by_default());
     rows
 }
 
 fn run_oneshot(opts: &Opts, json: bool) -> io::Result<()> {
     let mut mon = Monitor::new(HIST_LEN)?;
     collect_snapshot(&mut mon, opts)?;
-    let rows = sorted_rows(&mon);
+    let rows = sorted_rows(&mon, opts.sort);
     if json {
         print_json(&rows);
     } else {
@@ -204,7 +215,7 @@ fn run_diag(opts: &Opts) -> io::Result<()> {
         }
     };
     collect_snapshot(&mut mon, opts)?;
-    let rows = sorted_rows(&mon);
+    let rows = sorted_rows(&mon, SortKey::Rate); // top talkers, whatever --sort says
     let total: f64 = rows.iter().map(|r| r.total_rate()).sum();
     println!(
         "  privilege        : {}",
@@ -535,6 +546,8 @@ OPTIONS:
     --json            One snapshot as a JSON array on stdout (pipe into jq)
     --diag            Connectivity + permission diagnostics
     --interval SECS   Refresh / sampling interval (default 1.0, 0.2 to 3600)
+    --sort KEY        Row order for --once / --json: rate (default), total,
+                      name, conns or pid — the TUI's r/t/n/c/i, same directions
     --no-resolve      Skip reverse-DNS of remote hosts (TUI)
     --mouse           Capture the mouse for wheel-scroll (off by default, so
                       terminal text selection keeps working; keys still scroll)
@@ -584,8 +597,22 @@ mod tests {
         assert_eq!(o.interval, 2.5);
         assert!(!o.resolve);
         assert!(o.mouse);
+        assert_eq!(o.sort, SortKey::Rate);
 
         assert!(opts_from(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn sort_flag_takes_the_tui_key_names() {
+        assert_eq!(opts_from(&["--sort", "name"]).unwrap().sort, SortKey::Name);
+        assert_eq!(
+            opts_from(&["--json", "--sort", "conns"]).unwrap().sort,
+            SortKey::Conns
+        );
+        for bad in ["--sort", "--sort x", "--sort Rate"] {
+            let args: Vec<&str> = bad.split(' ').collect();
+            assert!(opts_from(&args).is_err(), "{bad} should be rejected");
+        }
     }
 
     #[test]
