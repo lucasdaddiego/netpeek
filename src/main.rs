@@ -17,7 +17,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use netpeek::app::{App, Cmd, Mode};
 use netpeek::dns::Resolver;
-use netpeek::model::{Filter, ProcRow, SortKey, sort_rows};
+use netpeek::model::{Filter, Flow, ProcRow, SortKey, sort_rows};
 use netpeek::ntstat::Monitor;
 use netpeek::services::Services;
 use netpeek::{export, format, ui};
@@ -40,6 +40,8 @@ struct Opts {
     /// Row order for the one-shot modes (`--sort`), in the key's default
     /// direction — the same keys and directions the TUI's r/t/n/c/i use.
     sort: SortKey,
+    /// `--json --flows`: include every process's flows in the document.
+    flows: bool,
 }
 
 fn main() {
@@ -102,6 +104,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         resolve: true,
         mouse: false,
         sort: SortKey::Rate,
+        flows: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -128,10 +131,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             }
             "--no-resolve" => opts.resolve = false,
             "--mouse" => opts.mouse = true,
+            "--flows" => opts.flows = true,
             a if known_flags.contains(&a) => {}
             a => return Err(format!("unknown argument '{a}' (try --help)")),
         }
         i += 1;
+    }
+    if opts.flows && !args.iter().any(|a| a == "--json") {
+        return Err("--flows needs --json".to_string());
     }
     Ok(opts)
 }
@@ -195,7 +202,16 @@ fn run_oneshot(opts: &Opts, json: bool) -> io::Result<()> {
     collect_snapshot(&mut mon, opts)?;
     let rows = sorted_rows(&mon, opts.sort);
     if json {
-        print_json(&rows);
+        let per_proc: Vec<Vec<&Flow>> = if opts.flows {
+            rows.iter().map(|r| mon.engine().flows_for(r.pid)).collect()
+        } else {
+            Vec::new()
+        };
+        let flows = opts.flows.then_some(per_proc.as_slice());
+        print!(
+            "{}",
+            export::json_document(&rows, flows, opts.interval, &clock_iso8601_utc())
+        );
     } else {
         print!("{}", export::text_table(&rows));
     }
@@ -247,38 +263,6 @@ fn run_diag(opts: &Opts) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Minimal JSON array writer (keys alphabetised), no serde dependency.
-fn print_json(rows: &[ProcRow]) {
-    println!("[");
-    for (idx, r) in rows.iter().enumerate() {
-        let comma = if idx + 1 < rows.len() { "," } else { "" };
-        println!(
-            "  {{\"conns\": {}, \"name\": \"{}\", \"pid\": {}, \"rx_bytes\": {}, \"rx_rate\": {:.0}, \"tx_bytes\": {}, \"tx_rate\": {:.0}}}{comma}",
-            r.conns,
-            json_escape(&r.name),
-            r.pid,
-            r.rx_total,
-            r.rx_rate,
-            r.tx_total,
-            r.tx_rate,
-        );
-    }
-    println!("]");
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn run_tui(opts: &Opts) -> io::Result<i32> {
@@ -518,6 +502,26 @@ fn key_to_cmd(code: KeyCode, mods: KeyModifiers, mode: Mode) -> Option<Cmd> {
     }
 }
 
+/// Now as UTC ISO-8601 (`2026-10-06T12:00:00Z`) for the JSON `ts` field, via
+/// libc so there's no chrono dependency.
+fn clock_iso8601_utc() -> String {
+    // SAFETY: time/gmtime_r with a local tm output buffer.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::gmtime_r(&t, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
 /// Local wall-clock `HH:MM:SS` via libc, so there's no chrono dependency.
 fn clock_hms() -> String {
     // SAFETY: time/localtime_r with a local tm output buffer.
@@ -543,7 +547,10 @@ unprivileged for your own user's flows; run with sudo to see every process.
 
 OPTIONS:
     --once            One snapshot as a text table, then exit
-    --json            One snapshot as a JSON array on stdout (pipe into jq)
+    --json            One snapshot as a JSON document on stdout (pipe into jq):
+                      version, ts (UTC), interval and the per-process rows
+    --flows           With --json: include every process's flows (endpoints,
+                      protocol, TCP state, per-flow bytes and rates)
     --diag            Connectivity + permission diagnostics
     --interval SECS   Refresh / sampling interval (default 1.0, 0.2 to 3600)
     --sort KEY        Row order for --once / --json: rate (default), total,
@@ -567,10 +574,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_escaping() {
-        assert_eq!(json_escape("plain"), "plain");
-        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
-        assert_eq!(json_escape("tab\there"), "tab\\u0009here");
+    fn utc_timestamp_is_iso8601() {
+        let ts = clock_iso8601_utc();
+        assert_eq!(ts.len(), 20, "{ts}");
+        assert!(ts.ends_with('Z') && &ts[10..11] == "T" && &ts[4..5] == "-");
     }
 
     #[test]
@@ -600,6 +607,14 @@ mod tests {
         assert_eq!(o.sort, SortKey::Rate);
 
         assert!(opts_from(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn flows_flag_needs_json() {
+        assert!(opts_from(&["--json", "--flows"]).unwrap().flows);
+        assert!(!opts_from(&["--json"]).unwrap().flows);
+        assert!(opts_from(&["--flows"]).is_err());
+        assert!(opts_from(&["--once", "--flows"]).is_err());
     }
 
     #[test]

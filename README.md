@@ -79,8 +79,8 @@ no helper processes.
   the same key again to reverse.
 - **Filter** by process name or pid as you type (`/`).
 - **Pause / freeze** (`p`) to inspect a moment without the table moving under you.
-- **Scriptable** — `--once` (text snapshot), `--json` (pipe into `jq`), `--diag`
-  (connectivity + permission check).
+- **Scriptable** — `--once` (text snapshot), `--json [--flows]` (pipe into
+  `jq`), `--sort`, `--diag` (connectivity + permission check).
 - **Single static binary**, no runtime dependencies, no root.
 
 ## Why a custom tool?
@@ -119,7 +119,8 @@ Then run `netpeek` from any terminal. (Or just `cargo run --release`.)
 ```sh
 netpeek                   # interactive TUI (default)
 netpeek --once            # one snapshot as a text table, then exit
-netpeek --json            # one snapshot as a JSON array on stdout (pipe into jq)
+netpeek --json            # one snapshot as a JSON document on stdout (pipe into jq)
+netpeek --json --flows    # … with every process's flows included
 netpeek --diag            # connectivity + permission diagnostics
 netpeek --once --sort name  # one-shot row order: rate (default), total, name, conns, pid
 netpeek --interval 0.5    # faster refresh / sampling (default 1.0s, min 0.2)
@@ -131,7 +132,8 @@ netpeek --help            # usage summary
 | Flag | Description |
 |------|-------------|
 | `--once` | Single text-table snapshot (waits until every flow is named, then two samples for a real rate), then exit. |
-| `--json` | Single snapshot as a JSON array, sorted by rate, keys alphabetised. |
+| `--json` | Single snapshot as a JSON document (`version`, `ts`, `interval`, `processes`), keys alphabetised. |
+| `--flows` | With `--json`: each process carries its `flows` (endpoints, protocol, TCP state, per-flow bytes and rates). |
 | `--diag` | Print socket connectivity, privilege, flow/process counts and top talkers. |
 | `--interval SECS` | Refresh and rate-sampling interval (default `1.0`, `0.2`–`3600`). |
 | `--sort KEY` | Row order for `--once` / `--json`: `rate` (default), `total`, `name`, `conns` or `pid` — the TUI's <kbd>r</kbd>/<kbd>t</kbd>/<kbd>n</kbd>/<kbd>c</kbd>/<kbd>i</kbd>, in the same default directions. |
@@ -180,23 +182,37 @@ shows its local endpoint instead, tagged `(local)`.
 
 ## JSON / scripting output
 
-`netpeek --json` prints one object per process, sorted by current rate, keys
-alphabetised:
+`netpeek --json` prints one document: the netpeek `version`, the snapshot's
+`ts` (UTC, ISO-8601), the sampling `interval` the rates were measured over,
+and `processes` — one object per process in `--sort` order (rate by default),
+keys alphabetised:
 
 ```jsonc
-[
-  {"conns": 38, "name": "Google Chrome Helper", "pid": 5821,
-   "rx_bytes": 1932735012, "rx_rate": 4823117, "tx_bytes": 211238, "tx_rate": 831488},
-  {"conns": 6,  "name": "WiFiAgent", "pid": 698,
-   "rx_bytes": 46137344, "rx_rate": 122880, "tx_bytes": 9216, "tx_rate": 90112}
-]
+{
+  "interval": 1,
+  "processes": [
+    {"conns": 38, "name": "Google Chrome Helper", "pid": 5821,
+     "rx_bytes": 1932735012, "rx_rate": 4823117, "tx_bytes": 211238, "tx_rate": 831488},
+    {"conns": 6,  "name": "WiFiAgent", "pid": 698,
+     "rx_bytes": 46137344, "rx_rate": 122880, "tx_bytes": 9216, "tx_rate": 90112}
+  ],
+  "ts": "2026-10-06T19:44:03Z",
+  "version": "0.1.0"
+}
 ```
 
-`rx_rate`/`tx_rate` are bytes/sec; `rx_bytes`/`tx_bytes` are cumulative. Example —
-the five processes pulling the most down right now:
+`rx_rate`/`tx_rate` are bytes/sec; `rx_bytes`/`tx_bytes` are cumulative. With
+`--flows`, every process also carries a `flows` array — one object per socket
+with `local_ip`/`local_port`, `proto` (`tcp`/`udp`), `remote_ip`/`remote_port`
+(`null` for a LISTEN or unconnected socket), its own `rx_bytes`/`tx_bytes` and
+`rx_rate`/`tx_rate`, and the TCP `state` (`null` for UDP). Examples — the five
+processes pulling the most down right now, then every established connection
+to port 443:
 
 ```sh
-netpeek --json | jq -r 'sort_by(-.rx_rate) | .[:5][] | "\(.rx_rate)\t\(.name)"'
+netpeek --json | jq -r '.processes[:5][] | "\(.rx_rate)\t\(.name)"'
+netpeek --json --flows | jq -r '.processes[] | .name as $n | .flows[]
+  | select(.state == "ESTABLISHED" and .remote_port == 443) | "\($n)\t\(.remote_ip)"'
 ```
 
 ## How it works
