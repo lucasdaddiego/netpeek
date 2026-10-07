@@ -3,6 +3,8 @@
 //! same interface `nettop(1)` uses), unprivileged for your own user's flows.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -11,6 +13,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::widgets::TableState;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use netpeek::app::{App, Cmd, Mode};
 use netpeek::dns::Resolver;
@@ -57,22 +60,33 @@ fn main() {
     };
 
     let result = if args.iter().any(|a| a == "--diag") {
-        run_diag(&opts)
+        run_diag(&opts).map(|()| 0)
     } else if args.iter().any(|a| a == "--json") {
-        run_oneshot(&opts, true)
+        run_oneshot(&opts, true).map(|()| 0)
     } else if args.iter().any(|a| a == "--once") {
-        run_oneshot(&opts, false)
+        run_oneshot(&opts, false).map(|()| 0)
     } else {
         run_tui(&opts)
     };
 
-    if let Err(e) = result {
-        eprintln!("netpeek: {e}");
-        if e.kind() == io::ErrorKind::PermissionDenied {
-            eprintln!("  the network-statistics control rejected the connection.");
+    match result {
+        Ok(0) => {}
+        Ok(status) => std::process::exit(status),
+        Err(e) => {
+            eprintln!("netpeek: {e}");
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                eprintln!("  the network-statistics control rejected the connection.");
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
     }
+}
+
+/// Process exit status once the TUI has ended: 0 for a normal quit, or the
+/// shell convention `128 + signal` when a signal ended it — so `timeout 10
+/// netpeek` reports a failure and a supervisor can tell the two apart.
+fn exit_status(signal: usize) -> i32 {
+    if signal == 0 { 0 } else { 128 + signal as i32 }
 }
 
 /// Parse the option flags into [`Opts`]; `Err` carries the message `main` prints
@@ -285,11 +299,23 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn run_tui(opts: &Opts) -> io::Result<()> {
+fn run_tui(opts: &Opts) -> io::Result<i32> {
     let mut mon = Monitor::new(HIST_LEN)?;
     let services = load_services();
     let resolver = opts.resolve.then(Resolver::new);
     let mut app = App::default();
+
+    // SIGTERM / SIGHUP / SIGINT (`kill`, a closed terminal tab, `timeout`) set
+    // this flag to the signal number and the poll loop returns on its next
+    // pass (≤120 ms), so the TUI unwinds through the normal restore path —
+    // raw mode, the alternate screen and mouse capture all come back — instead
+    // of the default action killing the process mid-frame and leaving the
+    // shell needing `reset`. Raw mode turns Ctrl-C into a key event, so the
+    // SIGINT caught here is only ever an external one.
+    let signal = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGTERM, SIGHUP, SIGINT] {
+        signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize)?;
+    }
 
     let mut terminal = ratatui::init();
 
@@ -323,6 +349,7 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
             resolver.as_ref(),
             &mut app,
             opts,
+            &signal,
         )
     })();
 
@@ -330,7 +357,8 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
         let _ = execute!(io::stdout(), DisableMouseCapture);
     }
     ratatui::restore();
-    res
+    res?;
+    Ok(exit_status(signal.load(Ordering::Relaxed)))
 }
 
 fn run_loop(
@@ -340,6 +368,7 @@ fn run_loop(
     resolver: Option<&Resolver>,
     app: &mut App,
     opts: &Opts,
+    signal: &AtomicUsize,
 ) -> io::Result<()> {
     let interval = Duration::from_secs_f64(opts.interval);
     let elevated = elevated();
@@ -458,7 +487,9 @@ fn run_loop(
             }
         }
 
-        if app.should_quit {
+        // A signal ends the loop like `q` does; the caller restores the
+        // terminal and turns the signal into the exit status.
+        if app.should_quit || signal.load(Ordering::Relaxed) != 0 {
             return Ok(());
         }
     }
@@ -556,6 +587,14 @@ mod tests {
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
         assert_eq!(json_escape("tab\there"), "tab\\u0009here");
+    }
+
+    #[test]
+    fn exit_status_follows_the_shell_convention() {
+        assert_eq!(exit_status(0), 0);
+        assert_eq!(exit_status(SIGHUP as usize), 129);
+        assert_eq!(exit_status(SIGINT as usize), 130);
+        assert_eq!(exit_status(SIGTERM as usize), 143);
     }
 
     #[test]

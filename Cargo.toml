@@ -26,6 +26,9 @@ libc = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 # Bounded reverse-DNS cache (already in the tree via ratatui).
 lru = "0.18"
+# SIGTERM/SIGHUP/SIGINT → flag, so the TUI restores the terminal on `kill`
+# (already in the tree via crossterm; only the `flag` module is used).
+signal-hook = { version = "0.3", default-features = false }
 
 [profile.release]
 opt-level = 3

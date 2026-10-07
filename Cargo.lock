@@ -378,6 +378,7 @@ dependencies = [
  "libc",
  "lru",
  "ratatui",
+ "signal-hook",
 ]
 
 [[package]]
