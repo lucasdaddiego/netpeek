@@ -24,6 +24,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 libc = "0.2"
 # Safe, checked casting of the kernel's #[repr(C)] wire structs to/from bytes.
 bytemuck = { version = "1", features = ["derive"] }
+# Bounded reverse-DNS cache (already in the tree via ratatui).
+lru = "0.18"
 
 [profile.release]
 opt-level = 3
