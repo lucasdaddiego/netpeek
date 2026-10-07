@@ -29,6 +29,8 @@ lru = "0.18"
 # SIGTERM/SIGHUP/SIGINT → flag, so the TUI restores the terminal on `kill`
 # (already in the tree via crossterm; only the `flag` module is used).
 signal-hook = { version = "0.3", default-features = false }
+# Column fitting for the --once / --diag tables (already in the tree via ratatui).
+unicode-width = "0.2"
 
 [profile.release]
 opt-level = 3

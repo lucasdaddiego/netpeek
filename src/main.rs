@@ -20,7 +20,7 @@ use netpeek::dns::Resolver;
 use netpeek::model::{Filter, ProcRow, SortKey, sort_rows};
 use netpeek::ntstat::Monitor;
 use netpeek::services::Services;
-use netpeek::{format, ui};
+use netpeek::{export, format, ui};
 
 const HIST_LEN: usize = 60;
 const DEFAULT_INTERVAL: f64 = 1.0;
@@ -186,7 +186,7 @@ fn run_oneshot(opts: &Opts, json: bool) -> io::Result<()> {
     if json {
         print_json(&rows);
     } else {
-        print_table(&rows);
+        print!("{}", export::text_table(&rows));
     }
     Ok(())
 }
@@ -227,44 +227,15 @@ fn run_diag(opts: &Opts) -> io::Result<()> {
         println!("\n  top talkers:");
         for r in rows.iter().take(5) {
             println!(
-                "    {:>6}  {:<22}  ↓{:>10}  ↑{:>10}",
+                "    {:>6}  {}  ↓{:>10}  ↑{:>10}",
                 r.pid,
-                trunc(&r.name, 22),
+                export::pad(&export::trunc(&r.name, 22), 22),
                 format::rate(r.rx_rate),
                 format::rate(r.tx_rate)
             );
         }
     }
     Ok(())
-}
-
-fn trunc(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n.saturating_sub(1)).chain(['…']).collect()
-    }
-}
-
-fn print_table(rows: &[ProcRow]) {
-    println!(
-        "{:>6}  {:<24}  {:>11}  {:>11}  {:>10}  {:>5}",
-        "PID", "PROCESS", "DOWN/s", "UP/s", "TOTAL", "CONNS"
-    );
-    for r in rows {
-        println!(
-            "{:>6}  {:<24}  {:>11}  {:>11}  {:>10}  {:>5}",
-            r.pid,
-            trunc(&r.name, 24),
-            format::rate(r.rx_rate),
-            format::rate(r.tx_rate),
-            format::bytes(r.total_bytes()),
-            r.conns
-        );
-    }
-    if rows.is_empty() {
-        println!("(no per-process network flows seen)");
-    }
 }
 
 /// Minimal JSON array writer (keys alphabetised), no serde dependency.
@@ -595,12 +566,6 @@ mod tests {
         assert_eq!(exit_status(SIGHUP as usize), 129);
         assert_eq!(exit_status(SIGINT as usize), 130);
         assert_eq!(exit_status(SIGTERM as usize), 143);
-    }
-
-    #[test]
-    fn truncation_helper() {
-        assert_eq!(trunc("short", 10), "short");
-        assert_eq!(trunc("a-very-long-process-name", 8), "a-very-…");
     }
 
     fn opts_from(args: &[&str]) -> Result<Opts, String> {

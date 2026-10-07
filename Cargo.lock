@@ -379,6 +379,7 @@ dependencies = [
  "lru",
  "ratatui",
  "signal-hook",
+ "unicode-width",
 ]
 
 [[package]]
