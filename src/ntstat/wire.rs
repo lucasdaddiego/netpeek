@@ -325,16 +325,56 @@ pub fn parse_sockaddr(buf: &[u8], off: usize) -> Option<Endpoint> {
     }
 }
 
-/// Neutralise control characters in a process name so a hostile one can't
-/// smuggle terminal escapes into the UI (`--once` / `--diag` print names
-/// straight to stdout). Every name that reaches a [`FlowDesc`] goes through
-/// here — the kernel's `pname` field via [`parse_pname`], and the
-/// `proc_pidpath` fallback in [`super::Monitor::apply`], since a macOS filename
-/// may hold any byte but `/` and NUL.
+/// Neutralise control and format characters in a name so a hostile one can't
+/// smuggle terminal escapes — or reorder what the user reads — into the UI
+/// (`--once` / `--diag` print names straight to stdout). `is_control` is the
+/// Cc class (C0 and C1); [`is_format`] adds Cf, which it does not cover: a
+/// right-to-left override renders `evil\u{202E}txt.sh` as `evil.hs.txt`.
+/// Every name that reaches a [`FlowDesc`] goes through here — the kernel's
+/// `pname` field via [`parse_pname`], and the `proc_pidpath` fallback in
+/// [`super::Monitor::apply`], since a macOS filename may hold any byte but `/`
+/// and NUL — and so does every reverse-DNS answer ([`crate::dns`]).
 pub fn sanitize_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .map(|c| {
+            if c.is_control() || is_format(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
         .collect()
+}
+
+/// Unicode general category Cf (format characters), which `char::is_control`
+/// leaves alone. The standard library has no general-category query, so the
+/// ranges are listed: soft hyphen, the Arabic/Syriac/Mongolian marks, zero-width
+/// spaces and joiners, the bidi embeddings/overrides/isolates, word joiner and
+/// invisible operators, the BOM, interlinear annotations, Kaithi and Egyptian
+/// format controls, Duployan, musical beams, and the tag characters.
+fn is_format(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE007F
+    )
 }
 
 /// Decode a NUL-terminated, fixed-width process name field, stripping control
@@ -653,6 +693,20 @@ mod tests {
         assert_eq!(sanitize_name("a\u{7}b\nc"), "a\u{fffd}b\u{fffd}c");
         // printable Unicode is untouched
         assert_eq!(sanitize_name("café ✓"), "café ✓");
+    }
+
+    #[test]
+    fn sanitize_name_neutralises_format_characters() {
+        // Cf passes `is_control`: a right-to-left override, zero-width space,
+        // BOM, soft hyphen, an isolate, a tag character and a Mongolian vowel
+        // separator all become U+FFFD, as does an 8-bit C1 control.
+        assert_eq!(sanitize_name("evil\u{202e}txt.sh"), "evil\u{fffd}txt.sh");
+        assert_eq!(
+            sanitize_name("a\u{200b}b\u{feff}c\u{ad}d\u{2066}e\u{e0041}f\u{180e}g\u{9b}h"),
+            "a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e\u{fffd}f\u{fffd}g\u{fffd}h"
+        );
+        // Letters, symbols, CJK and a plain dash are not format characters.
+        assert_eq!(sanitize_name("日本語 — ok"), "日本語 — ok");
     }
 
     #[test]

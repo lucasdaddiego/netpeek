@@ -13,6 +13,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::ntstat::wire::sanitize_name;
+
 type Cache = Arc<Mutex<HashMap<IpAddr, Option<String>>>>;
 type InFlight = Arc<Mutex<HashSet<IpAddr>>>;
 
@@ -88,6 +90,8 @@ impl Default for Resolver {
 
 /// Blocking PTR lookup via `getnameinfo` with `NI_NAMEREQD` (so a missing PTR
 /// returns an error rather than the numeric form, which we map to `None`).
+/// The answer is whatever the remote side's DNS operator put in the PTR
+/// record, so it is sanitized like a process name before it is cached.
 fn reverse_dns(ip: IpAddr) -> Option<String> {
     let sock = SocketAddr::new(ip, 0);
     let (sa, len): (libc::sockaddr_storage, libc::socklen_t) = socketaddr_to_c(&sock);
@@ -109,10 +113,12 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
         return None;
     }
     // SAFETY: getnameinfo NUL-terminates within the buffer on success.
-    let s = unsafe { CStr::from_ptr(host.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
-    if s.is_empty() { None } else { Some(s) }
+    let s = unsafe { CStr::from_ptr(host.as_ptr()) }.to_string_lossy();
+    if s.is_empty() {
+        None
+    } else {
+        Some(sanitize_name(&s))
+    }
 }
 
 /// Marshal a `SocketAddr` into a C `sockaddr_storage` + length.
