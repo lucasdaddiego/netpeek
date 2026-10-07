@@ -101,9 +101,24 @@ sortable, expandable TUI — unprivileged, in one binary.
 
 ## Install
 
+**From source** (a Rust toolchain, 1.88+):
+
 ```sh
 make            # build an optimised release binary + symlink `netpeek` into ~/.bin
 make clean      # remove the binary and the launcher
+cargo install --git https://github.com/lucasdaddiego/netpeek   # or straight into ~/.cargo/bin
+```
+
+**From a release**: every tag publishes `netpeek-<version>-macos-universal.zip`
+(arm64 + x86_64, built with `--locked` from the audited lockfile) and a
+`SHA256SUMS` file on the [releases page](https://github.com/lucasdaddiego/netpeek/releases).
+Verify, then let macOS run the (ad-hoc signed, not notarized) binary:
+
+```sh
+shasum -a 256 -c SHA256SUMS            # must print: netpeek-<version>-macos-universal.zip: OK
+unzip netpeek-<version>-macos-universal.zip
+xattr -d com.apple.quarantine netpeek  # Gatekeeper flags browser downloads
+mv netpeek ~/.bin/
 ```
 
 Make sure `~/.bin` is on your `PATH`:
