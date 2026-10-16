@@ -96,12 +96,12 @@ sortable, expandable TUI — unprivileged, in one binary.
 
 - **macOS** (built & tested on **macOS 26 / Apple Silicon**; targets macOS 13+ —
   see [limitations](#accuracy--honest-limitations) for why 13 is the floor).
-- A **Rust toolchain** (1.88+) to build (`brew install rust`, or rustup). That's
+- A **Rust toolchain** (1.99+) to build (`brew install rust`, or rustup). That's
   it — no crates fetched at runtime, no system libraries beyond what macOS ships.
 
 ## Install
 
-**From source** (a Rust toolchain, 1.88+):
+**From source** (a Rust toolchain, 1.99+):
 
 ```sh
 make            # build an optimised release binary + symlink `netpeek` into ~/.bin

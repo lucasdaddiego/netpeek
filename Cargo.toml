@@ -2,7 +2,7 @@
 name = "netpeek"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 license = "MIT"
 description = "Live per-process network bandwidth TUI for macOS — real pid-attributed rates and flows from the same private kernel interface nettop uses, no sudo, no packet capture."
 repository = "https://github.com/lucasdaddiego/netpeek"
