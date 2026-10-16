@@ -40,6 +40,8 @@ struct Opts {
     /// Row order for the one-shot modes (`--sort`), in the key's default
     /// direction — the same keys and directions the TUI's r/t/n/c/i use.
     sort: SortKey,
+    /// `--reverse`: flip the one-shot row order (the TUI's repeat-a-sort-key).
+    reverse: bool,
     /// `--json --flows`: include every process's flows in the document.
     flows: bool,
 }
@@ -104,6 +106,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         resolve: true,
         mouse: false,
         sort: SortKey::Rate,
+        reverse: false,
         flows: false,
     };
     let mut i = 0;
@@ -129,6 +132,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     None => return Err("--sort needs one of rate, total, name, conns, pid".into()),
                 }
             }
+            "--reverse" => opts.reverse = true,
             "--no-resolve" => opts.resolve = false,
             "--mouse" => opts.mouse = true,
             "--flows" => opts.flows = true,
@@ -191,16 +195,22 @@ fn collect_snapshot(mon: &mut Monitor, opts: &Opts) -> io::Result<()> {
     Ok(())
 }
 
-fn sorted_rows(mon: &Monitor, key: SortKey) -> Vec<ProcRow> {
+/// Sort direction for a one-shot key: the key's default (the TUI's first
+/// press), or the opposite with `--reverse` (the TUI's second press).
+fn one_shot_descending(key: SortKey, reverse: bool) -> bool {
+    key.descending_by_default() != reverse
+}
+
+fn sorted_rows(mon: &Monitor, key: SortKey, reverse: bool) -> Vec<ProcRow> {
     let mut rows: Vec<ProcRow> = mon.engine().rows().to_vec();
-    sort_rows(&mut rows, key, key.descending_by_default());
+    sort_rows(&mut rows, key, one_shot_descending(key, reverse));
     rows
 }
 
 fn run_oneshot(opts: &Opts, json: bool) -> io::Result<()> {
     let mut mon = Monitor::new(HIST_LEN)?;
     collect_snapshot(&mut mon, opts)?;
-    let rows = sorted_rows(&mon, opts.sort);
+    let rows = sorted_rows(&mon, opts.sort, opts.reverse);
     if json {
         let per_proc: Vec<Vec<&Flow>> = if opts.flows {
             rows.iter().map(|r| mon.engine().flows_for(r.pid)).collect()
@@ -231,7 +241,7 @@ fn run_diag(opts: &Opts) -> io::Result<()> {
         }
     };
     collect_snapshot(&mut mon, opts)?;
-    let rows = sorted_rows(&mon, SortKey::Rate); // top talkers, whatever --sort says
+    let rows = sorted_rows(&mon, SortKey::Rate, false); // top talkers, whatever --sort says
     let total: f64 = rows.iter().map(|r| r.total_rate()).sum();
     println!(
         "  privilege        : {}",
@@ -555,6 +565,8 @@ OPTIONS:
     --interval SECS   Refresh / sampling interval (default 1.0, 0.2 to 3600)
     --sort KEY        Row order for --once / --json: rate (default), total,
                       name, conns or pid — the TUI's r/t/n/c/i, same directions
+    --reverse         With --once / --json: flip the --sort direction (the
+                      TUI's second press of the same key)
     --no-resolve      Skip reverse-DNS of remote hosts (TUI)
     --mouse           Capture the mouse for wheel-scroll (off by default, so
                       terminal text selection keeps working; keys still scroll)
@@ -624,9 +636,25 @@ mod tests {
             opts_from(&["--json", "--sort", "conns"]).unwrap().sort,
             SortKey::Conns
         );
+        assert!(!opts_from(&["--once"]).unwrap().reverse);
+        assert!(opts_from(&["--once", "--reverse"]).unwrap().reverse);
         for bad in ["--sort", "--sort x", "--sort Rate"] {
             let args: Vec<&str> = bad.split(' ').collect();
             assert!(opts_from(&args).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn reverse_flips_each_keys_default_direction() {
+        // rate/total/conns start biggest-first, name/pid start ascending —
+        // --reverse gives the other one, like a second press in the TUI.
+        for key in [SortKey::Rate, SortKey::Total, SortKey::Conns] {
+            assert!(one_shot_descending(key, false));
+            assert!(!one_shot_descending(key, true));
+        }
+        for key in [SortKey::Name, SortKey::Pid] {
+            assert!(!one_shot_descending(key, false));
+            assert!(one_shot_descending(key, true));
         }
     }
 
