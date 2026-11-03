@@ -13,6 +13,10 @@ updates:
       cargo:
         patterns:
           - "*"
+    # ratatui-core 0.1.2 needs lru ^0.18; remove when it allows 0.19.
+    ignore:
+      - dependency-name: "lru"
+        versions: [">=0.19"]
 
   # The workflow actions themselves (checkout, rust-cache, install-action, …),
   # pinned by commit SHA in the workflows — this is what moves the SHAs.
