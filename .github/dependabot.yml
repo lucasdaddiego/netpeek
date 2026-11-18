@@ -6,6 +6,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Wait 7 days before a version update PR (security updates ignore this).
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: deps
@@ -24,6 +27,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Wait 7 days before a version update PR (security updates ignore this).
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: ci
