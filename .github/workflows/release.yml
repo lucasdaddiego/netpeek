@@ -33,7 +33,8 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # No build cache here: the published binary comes from a clean build, so a
+      # poisoned cache entry cannot reach a release.
 
       - name: Version (a tag must match Cargo.toml)
         id: meta
